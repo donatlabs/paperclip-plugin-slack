@@ -1,5 +1,5 @@
 import type { PluginContext, PluginHealthDiagnostics } from "@paperclipai/plugin-sdk";
-import { normalizeSecretRef } from "./secret-ref-validation.js";
+import { normalizeSecretRef, redactSecretRefs } from "./secret-ref-validation.js";
 
 export type SlackRuntimeHealth = PluginHealthDiagnostics & {
   message?: string;
@@ -32,7 +32,7 @@ export async function resolveStartupSlackToken(
     setHealth({ status: "ok" });
     return token;
   } catch (err) {
-    const error = String(err);
+    const error = redactSecretRefs(String(err), tokenRef);
     setHealth({
       status: "degraded",
       message: `Slack bot token secret resolution failed: ${error}`,

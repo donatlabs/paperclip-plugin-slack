@@ -515,3 +515,105 @@ describe("webhook fails closed until configured", () => {
     );
   });
 });
+
+describe("round-1 review fixes", () => {
+  it("F1: rejects a slash-command whose parsed body claims type=url_verification", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A, storedConfig());
+    host.ctx.logger.warn.mockClear();
+
+    // The url_verification exemption must be scoped to the Events endpoint; a
+    // slash-command carrying that body must still be signature-verified.
+    await definition().onWebhook({
+      endpointKey: "slash-command",
+      headers: {},
+      rawBody: "command=/clip&text=status",
+      parsedBody: { type: "url_verification", command: "/clip" },
+      requestId: "req-f1",
+    });
+
+    expect(host.ctx.http.fetch).not.toHaveBeenCalled();
+    expect(host.ctx.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("invalid Slack signature"),
+    );
+  });
+
+  it("F2: the daily digest processes only the owner across multiple visible companies", async () => {
+    const host = buildHost({ companies: [COMPANY_A, COMPANY_B] });
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A, storedConfig({ enableDailyDigest: true }));
+
+    const digest = host.ctx.jobs.register.mock.calls.find((c: any[]) => c[0] === "daily-digest")![1];
+    await digest();
+
+    expect(host.ctx.issues.list).toHaveBeenCalledWith(expect.objectContaining({ companyId: COMPANY_A }));
+    expect(host.ctx.issues.list).not.toHaveBeenCalledWith(expect.objectContaining({ companyId: COMPANY_B }));
+  });
+
+  it("F3: refuses remove_watch from a non-owner company", async () => {
+    const host = buildHost({ companies: [COMPANY_A, COMPANY_B] });
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_B, storedConfig());
+
+    const remove = toolHandler(host.ctx, "remove_watch");
+    const result = await remove({ watchId: "watch-x" }, { companyId: COMPANY_A });
+
+    expect(result.error).toMatch(/not configured yet/);
+  });
+
+  it("F4: normalizes a legacy bare-UUID signing-secret ref before resolving", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A, storedConfig({ slackSigningSecretRef: SIGNING_SECRET_ID }));
+
+    expect(host.ctx.secrets.resolve).toHaveBeenCalledWith(
+      { type: "secret_ref", secretId: SIGNING_SECRET_ID },
+      { companyId: COMPANY_A, configPath: "slackSigningSecretRef" },
+    );
+    expect(_getRuntimeForTests()?.signingSecret).toBe("signing-secret");
+    expect(await definition().onHealth()).toEqual({ status: "ok" });
+  });
+
+  it("F4: builds the runtime but degrades health when the signing secret cannot resolve", async () => {
+    const host = buildHost();
+    host.ctx.secrets.resolve.mockImplementation(async (ref: unknown, opts?: { configPath?: string }) => {
+      if (opts?.configPath === "slackSigningSecretRef") throw new Error("signing resolution failed");
+      if (typeof ref === "string") throw new Error("string refs rejected");
+      return "xoxb-token";
+    });
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A, storedConfig());
+
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
+    expect(_getRuntimeForTests()?.signingSecret).toBeNull();
+    const health = await definition().onHealth();
+    expect(health.status).toBe("degraded");
+    expect(health.message).toMatch(/signing secret/i);
+  });
+
+  it("F5: redacts a resolver error that embeds the supplied secret id", async () => {
+    const host = buildHost();
+    host.ctx.secrets.resolve.mockImplementation(async (ref: unknown) => {
+      throw new Error(`host rejected ${JSON.stringify(ref)} secretId=${(ref as any)?.secretId ?? ref}`);
+    });
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A, storedConfig());
+
+    const diagnostics = await definition().onHealth();
+    expect(diagnostics.status).toBe("degraded");
+    expect(host.everythingSaid(diagnostics)).not.toContain(SECRET_ID);
+  });
+
+  it("F6: a failed refresh that also changes the base URL leaves the retained runtime coherent", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A, storedConfig());
+    const baseBefore = _getRuntimeForTests()?.baseUrl;
+
+    await host.deliver(COMPANY_A, storedConfig({ slackTokenRef: "", paperclipBaseUrl: "http://changed.invalid:9999" }));
+
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
+    expect(_getRuntimeForTests()?.baseUrl).toBe(baseBefore);
+  });
+});

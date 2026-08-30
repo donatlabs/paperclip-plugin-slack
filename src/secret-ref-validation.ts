@@ -81,9 +81,30 @@ function describeBadValue(value: unknown): string {
   if (typeof value !== "string") return `<${typeof value}>`;
   const trimmed = value.trim();
   if (trimmed.length === 0) return "<empty string>";
-  // Truncate to avoid leaking long pasted secrets into error logs.
-  const sample = trimmed.length > 16 ? `${trimmed.slice(0, 12)}…` : trimmed;
-  return `"${sample}"`;
+  // Never echo any characters of the supplied value: an operator may paste a
+  // raw Slack token here, and even a prefix in an error log is a leak.
+  return `<non-UUID string, length ${trimmed.length}>`;
+}
+
+/**
+ * Strip any occurrence of the given secret references out of a message before
+ * it is logged or published to health. The governed host interpolates the ref
+ * it rejected into its error text, so a resolver error can otherwise carry the
+ * supplied secretId (or a raw pasted value) into durable diagnostics.
+ */
+export function redactSecretRefs(message: string, ...refs: unknown[]): string {
+  let out = message;
+  for (const ref of refs) {
+    const id = normalizeSecretRefId(ref);
+    if (id) out = out.split(id).join("[redacted]");
+    if (ref && typeof ref === "object") {
+      out = out.split(JSON.stringify(ref)).join("[redacted]");
+    } else if (typeof ref === "string") {
+      const trimmed = ref.trim();
+      if (trimmed.length >= 6) out = out.split(trimmed).join("[redacted]");
+    }
+  }
+  return out;
 }
 
 function fieldError(key: string, value: unknown): string {

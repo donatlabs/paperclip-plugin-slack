@@ -53,7 +53,9 @@ import {
 import { resolveStartupSlackToken, SECRET_RESOLUTION_ISSUE_URL, type SlackRuntimeHealth } from "./runtime-token.js";
 import {
   isUsableSecretRef,
+  normalizeSecretRef,
   normalizeSecretRefId,
+  redactSecretRefs,
   validateSecretRefFields,
 } from "./secret-ref-validation.js";
 
@@ -339,28 +341,27 @@ async function bootstrapRuntime(
     return null;
   }
 
-  if (config.paperclipBaseUrl) {
-    setBaseUrl(config.paperclipBaseUrl);
-  }
-
   const token = await resolveStartupSlackToken(ctx, config.slackTokenRef, setRuntimeHealth, companyId);
   if (!token) {
     ctx.logger.warn("Slack plugin runtime disabled because Slack token could not be resolved", { companyId });
     return null;
   }
 
-  // Signing secret is optional at resolution time: without it webhook signatures
-  // cannot be verified, so onWebhook fails closed until it resolves.
+  // Signing secret is required for inbound webhook verification. Normalize a
+  // legacy bare-UUID ref before resolving (the token path does the same) — a
+  // current host rejects a raw string ref outright (F4). onWebhook fails closed
+  // until it resolves.
   let signingSecret: string | null = null;
   if (isUsableSecretRef(config.slackSigningSecretRef)) {
     try {
-      signingSecret = await ctx.secrets.resolve(config.slackSigningSecretRef as string, {
+      const signingRef = normalizeSecretRef(config.slackSigningSecretRef) ?? config.slackSigningSecretRef;
+      signingSecret = await ctx.secrets.resolve(signingRef as string, {
         companyId,
         configPath: "slackSigningSecretRef",
       });
     } catch (err) {
-      ctx.logger.warn("Slack signing secret could not be resolved — webhook signature verification disabled", {
-        error: String(err),
+      ctx.logger.warn("Slack signing secret could not be resolved — inbound webhook verification is disabled", {
+        error: redactSecretRefs(String(err), config.slackSigningSecretRef),
         companyId,
       });
     }
@@ -374,11 +375,26 @@ async function bootstrapRuntime(
     baseUrl: config.paperclipBaseUrl || "http://localhost:3100",
   };
 
-  // Publish, then update the legacy mirrors the module-level handlers read.
+  // Publish as one coherent snapshot, THEN apply the formatter-global side
+  // effect and update the legacy mirrors the module-level handlers read. Doing
+  // setBaseUrl only here keeps a failed refresh from mutating global state the
+  // retained old runtime would be inconsistent with (F6).
   runtime = rt;
+  if (config.paperclipBaseUrl) setBaseUrl(config.paperclipBaseUrl);
   pluginToken = token;
   pluginConfig = config;
   slackSigningSecret = signingSecret;
+
+  if (!signingSecret) {
+    // Outbound works, but every inbound webhook fails closed without the signing
+    // secret. Report that honestly instead of leaving health "ok" (F4).
+    degradeHealth(
+      "Slack bot token resolved, but the signing secret is unavailable — inbound webhooks " +
+        "(events, slash commands, interactivity) are rejected until it resolves.",
+      "slack-signing-secret-unresolved",
+      { companyId },
+    );
+  }
 
   ctx.logger.info("Slack plugin runtime bootstrapped from delivered configuration", { companyId });
   return rt;
@@ -1052,11 +1068,11 @@ const plugin = definePlugin({
           required: ["watchId"],
         },
       },
-      async (params: unknown, _runCtx) => {
+      async (params: unknown, runCtx) => {
         const p = params as Record<string, unknown>;
-        const rt = ensureRuntime();
+        const rt = ensureRuntime(runCtx.companyId);
         if (!rt) return { error: "Slack plugin is not configured yet" };
-        const removed = await removeWatch(ctx, String(p.watchId));
+        const removed = await removeWatch(ctx, String(p.watchId), runCtx.companyId);
         return { content: JSON.stringify({ removed, watchId: String(p.watchId) }) };
       },
     );
@@ -1071,7 +1087,9 @@ const plugin = definePlugin({
           properties: {},
         },
       },
-      async (_params, _runCtx) => {
+      async (_params, runCtx) => {
+        const rt = ensureRuntime(runCtx.companyId);
+        if (!rt) return { error: "Slack plugin is not configured yet" };
         const templates = BUILTIN_WATCH_TEMPLATES.map((t) => ({
           name: t.name,
           eventPattern: t.eventPattern,
@@ -1267,7 +1285,10 @@ const plugin = definePlugin({
       ctx.jobs.register("daily-digest", async () => {
         const rt = ensureRuntime();
         if (!rt || !rt.config.enableDailyDigest) return;
-        const companies = await ctx.companies.list({ limit: 100, offset: 0 });
+        // Single-tenant: this worker serves only its owner. Iterating every
+        // visible company would read their data and post it with the OWNER's
+        // token/config (F2). Operate strictly on rt.companyId.
+        const companies = [{ id: rt.companyId }];
         for (const company of companies) {
           const channelId = await resolveChannel(ctx, company.id, rt.config.defaultChannelId);
           if (!channelId) continue;
@@ -1377,7 +1398,10 @@ const plugin = definePlugin({
     ctx.jobs.register("check-escalation-timeouts", async () => {
       const rt = ensureRuntime();
       if (!rt) return;
-      const companies = await ctx.companies.list({ limit: 100, offset: 0 });
+      // Single-tenant: this worker serves only its owner. Iterating every
+      // visible company would read their data and post it with the OWNER's
+      // token/config (F2). Operate strictly on rt.companyId.
+      const companies = [{ id: rt.companyId }];
       const timeoutMs = rt.config.escalationTimeoutMs ?? 900000;
       const now = Date.now();
 
@@ -1445,7 +1469,10 @@ const plugin = definePlugin({
     ctx.jobs.register("check-watches", async () => {
       const rt = ensureRuntime();
       if (!rt) return;
-      const companies = await ctx.companies.list({ limit: 100, offset: 0 });
+      // Single-tenant: this worker serves only its owner. Iterating every
+      // visible company would read their data and post it with the OWNER's
+      // token/config (F2). Operate strictly on rt.companyId.
+      const companies = [{ id: rt.companyId }];
       for (const company of companies) {
         // Get recent events from state (populated by event listeners below)
         const recentEventsRaw = await ctx.state.get({
@@ -1687,7 +1714,12 @@ const plugin = definePlugin({
   async onWebhook(input: PluginWebhookInput): Promise<void> {
     // Verify Slack request signature (skip for url_verification challenge)
     const body = input.parsedBody as Record<string, unknown> | undefined;
-    const isVerificationChallenge = body?.type === "url_verification";
+    // Scope the signature exemption to a url_verification body on the Events
+    // endpoint ONLY. Otherwise an attacker sends a slash-command / interactivity
+    // request whose parsed body carries type=url_verification and skips
+    // signature verification entirely (F1).
+    const isVerificationChallenge =
+      input.endpointKey === WEBHOOK_KEYS.slackEvents && body?.type === "url_verification";
 
     const rt = ensureRuntime();
     if (!rt) {

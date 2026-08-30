@@ -4,6 +4,7 @@ import {
   normalizeSecretRef,
   normalizeSecretRefId,
   isUsableSecretRef,
+  redactSecretRefs,
   validateSecretRefFields,
 } from "../src/secret-ref-validation.js";
 
@@ -83,6 +84,27 @@ describe("validateSecretRefFields", () => {
     });
     expect(errors).toHaveLength(1);
     expect(errors[0]).toMatch(/slackTokenRef must be the UUID/);
-    expect(errors[0]).not.toContain("xoxb-raw-token-do-not-leak-xxxxxxxx");
+    // Not even a prefix of the pasted value may appear.
+    expect(errors[0]).not.toContain("xoxb");
+  });
+});
+
+describe("redactSecretRefs", () => {
+  it("strips an object ref's secretId, its JSON form, and a raw string ref", () => {
+    const objMsg = `host rejected ${JSON.stringify({ type: "secret_ref", secretId: UUID })} secretId=${UUID}`;
+    const redactedObj = redactSecretRefs(objMsg, { type: "secret_ref", secretId: UUID });
+    expect(redactedObj).not.toContain(UUID);
+    expect(redactedObj).toContain("[redacted]");
+
+    const strMsg = `Invalid secret reference for plugin: raw-token-value-123456`;
+    const redactedStr = redactSecretRefs(strMsg, "raw-token-value-123456");
+    expect(redactedStr).not.toContain("raw-token-value-123456");
+    expect(redactedStr).toContain("[redacted]");
+  });
+
+  it("leaves an unrelated message untouched", () => {
+    expect(redactSecretRefs("company context is required", UUID)).toBe(
+      "company context is required",
+    );
   });
 });
