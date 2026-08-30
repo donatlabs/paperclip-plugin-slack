@@ -322,6 +322,65 @@ describe("bootstrap from a config delivery", () => {
     expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
     expect(await definition().onHealth()).toEqual({ status: "ok" });
   });
+
+  it("keeps the live runtime when the owner's re-save has a broken token", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A, storedConfig());
+    expect(_getRuntimeForTests()?.token).toBe("xoxb-token");
+
+    // A re-saves with an unresolvable token: the plugin degrades but keeps
+    // serving on the runtime it already has, rather than going fully dark.
+    await host.deliver(COMPANY_A, storedConfig({ slackTokenRef: "" }));
+
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
+    expect(_getRuntimeForTests()?.token).toBe("xoxb-token");
+    expect((await definition().onHealth()).status).toBe("degraded");
+  });
+});
+
+describe("context-less delivery to a running install (720/722)", () => {
+  it("refreshes in place when the running company re-saves without context", async () => {
+    const host = buildHost({
+      companies: [COMPANY_A],
+      rows: { [COMPANY_A]: storedConfig() },
+      enforceInvocationScope: true,
+    });
+    host.setInvocationScope(COMPANY_A);
+    await definition().setup(host.ctx);
+    await definition().onConfigChanged(storedConfig(), { companyId: COMPANY_A });
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
+
+    host.setInvocationScope(COMPANY_A);
+    await definition().onConfigChanged(storedConfig({ defaultChannelId: "C77NEW7NEW7" })); // no context
+    host.setInvocationScope(null);
+
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
+    expect(_getRuntimeForTests()?.config.defaultChannelId).toBe("C77NEW7NEW7");
+  });
+
+  it("leaves the running company untouched when the delivery belongs to another", async () => {
+    const host = buildHost({
+      companies: [COMPANY_A, COMPANY_B],
+      rows: { [COMPANY_A]: storedConfig(), [COMPANY_B]: storedConfig() },
+      enforceInvocationScope: true,
+    });
+    host.setInvocationScope(COMPANY_A);
+    await definition().setup(host.ctx);
+    await definition().onConfigChanged(storedConfig(), { companyId: COMPANY_A });
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
+
+    host.setInvocationScope(COMPANY_B);
+    await definition().onConfigChanged(storedConfig({ defaultChannelId: "C99ZZZ9ZZZ9" })); // no context, B's invocation
+    host.setInvocationScope(null);
+
+    expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
+    expect(_getRuntimeForTests()?.config.defaultChannelId).toBe("C01ABC2DEF3");
+    expect(host.ctx.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining(`this install serves ${COMPANY_A}`),
+      expect.objectContaining({ runningCompanyId: COMPANY_A, deliveredCompanyId: COMPANY_B }),
+    );
+  });
 });
 
 describe("single-tenant ownership", () => {

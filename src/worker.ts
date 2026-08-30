@@ -212,6 +212,11 @@ function claimOwnership(ctx: PluginContext, companyId: string, config: unknown):
         "matching the host's single-tenant rule",
       { previousCompanyId: ownerCompanyId, companyId },
     );
+    // Retire the outgoing owner's runtime FIRST. Everything after can fail (the
+    // new owner may have no resolvable token), and a live runtime bound to a
+    // company that no longer owns the install is worse than none: a no-arg
+    // ensureRuntime() during the bootstrap window would otherwise still serve it.
+    runtime = null;
     ownerCompanyId = companyId;
     ownerConfigJson = configJson;
     refusedCompanies.delete(companyId);
@@ -313,6 +318,9 @@ async function bootstrapRuntime(
 ): Promise<SlackRuntime | null> {
   if (!claimOwnership(ctx, companyId, rawConfig)) return runtime;
 
+  // A failed (re-)bootstrap leaves any EXISTING runtime intact: an owner whose
+  // new save has a broken token keeps serving on the old one, degraded-but-live,
+  // until a valid save arrives. On a fresh install `runtime` is already null.
   const config = {
     ...DEFAULT_CONFIG,
     ...(rawConfig as Record<string, unknown>),
@@ -328,7 +336,6 @@ async function bootstrapRuntime(
       { companyId },
     );
     ctx.logger.warn("Slack plugin config has no resolvable bot token reference", { companyId });
-    runtime = null;
     return null;
   }
 
@@ -339,7 +346,6 @@ async function bootstrapRuntime(
   const token = await resolveStartupSlackToken(ctx, config.slackTokenRef, setRuntimeHealth, companyId);
   if (!token) {
     ctx.logger.warn("Slack plugin runtime disabled because Slack token could not be resolved", { companyId });
-    runtime = null;
     return null;
   }
 
