@@ -24,6 +24,8 @@ const manifest: PaperclipPluginManifestV1 = {
     "issues.wakeup",
     "issue.comments.read",
     "issue.comments.create",
+    "issue.interactions.read",
+    "issue.interactions.respond",
     "agents.read",
     "agent.sessions.create",
     "agent.sessions.send",

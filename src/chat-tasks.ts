@@ -21,6 +21,18 @@ export interface ChatIssuesClient {
   createComment(issueId: string, body: string): Promise<{ id: string }>;
   requestWakeup(issueId: string, reason: string): Promise<void>;
   listComments(issueId: string): Promise<Array<{ id: string; body: string; authorType: string }>>;
+  listInteractions(issueId: string): Promise<ChatInteraction[]>;
+  respondInteraction(issueId: string, interactionId: string, action: "accept" | "reject"): Promise<{ applied: boolean }>;
+}
+
+/** The part of a Paperclip issue-thread interaction the thread card needs. */
+export interface ChatInteraction {
+  id: string;
+  kind: string;
+  status: string;
+  title?: string | null;
+  summary?: string | null;
+  payload: Record<string, unknown>;
 }
 
 export interface ChatSlackClient {
@@ -29,6 +41,8 @@ export interface ChatSlackClient {
   removeReaction(channel: string, ts: string, name: string): Promise<void>;
   /** Slack's native thread status; resolves false when the workspace or token cannot show one. */
   setThreadStatus(channel: string, threadTs: string, status: string): Promise<boolean>;
+  postBlocks(channel: string, text: string, blocks: unknown[], threadTs?: string): Promise<{ ok: boolean; ts?: string; error?: string }>;
+  updateMessage(channel: string, ts: string, text: string, blocks?: unknown[]): Promise<{ ok: boolean; error?: string }>;
 }
 
 export interface ChatTasksConfig {
@@ -78,6 +92,18 @@ export const CHAT_STATE_KEYS = {
   ownComments: "chat-own-comments",
   /** issue id -> the run currently shown as working, so a stale finish cannot clear a newer start */
   working: (issueId: string) => `chat-working-${issueId}`,
+  /** interaction id -> { ts, status } of its card in the thread */
+  interaction: (id: string) => `chat-interaction-${id}`,
+  /** issue ids with a thread, for the interaction poll */
+  boundIssues: "chat-bound-issues",
+} as const;
+
+const BOUND_ISSUES_WINDOW = 200;
+
+/** action_id values of the interaction buttons; the value carries "<issueId>:<interactionId>". */
+export const INTERACTION_ACTIONS = {
+  accept: "chat_interaction_accept",
+  reject: "chat_interaction_reject",
 } as const;
 
 /** What the thread status says while an agent is on the task. */
@@ -195,6 +221,12 @@ export async function getIssueThread(state: ChatStateStore, issueId: string): Pr
 export async function bindThread(state: ChatStateStore, issueId: string, binding: ThreadBinding): Promise<void> {
   await state.set(CHAT_STATE_KEYS.thread(binding.channel, binding.threadTs), issueId);
   await state.set(CHAT_STATE_KEYS.issue(issueId), binding);
+  await rememberInRollingList(state, CHAT_STATE_KEYS.boundIssues, issueId, BOUND_ISSUES_WINDOW);
+}
+
+export async function listBoundIssues(state: ChatStateStore): Promise<string[]> {
+  const raw = await state.get(CHAT_STATE_KEYS.boundIssues);
+  return Array.isArray(raw) ? (raw as string[]) : [];
 }
 
 /**
@@ -373,4 +405,190 @@ async function safely(deps: ChatTasksDeps, fn: () => Promise<void>): Promise<voi
   } catch (err) {
     deps.log.warn("Slack call failed", { err: String(err) });
   }
+}
+
+// ---- interactions -----------------------------------------------------------
+//
+// An agent's question to the person (a confirmation, a set of questions, a
+// list of suggested tasks) is a card in the thread. The host raises no event
+// when one is created, so bound tasks are polled. The plugin SDK can accept
+// or reject an interaction but not answer questions or pick tasks, so those
+// cards carry the question and a link to answer in Tandem.
+
+type InteractionCard = { ts: string; status: string };
+
+const str = (v: unknown): string => (typeof v === "string" ? v : "");
+const rec = (v: unknown): Record<string, unknown> => (v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {});
+const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
+
+function interactionHeading(i: ChatInteraction): string {
+  switch (i.kind) {
+    case "request_confirmation":
+    case "request_checkbox_confirmation":
+      return "The agent asks you to confirm";
+    case "ask_user_questions":
+      return "The agent has questions";
+    case "suggest_tasks":
+      return "The agent suggests tasks";
+    case "request_item_verdicts":
+      return "The agent asks for verdicts";
+    default:
+      return "The agent needs you";
+  }
+}
+
+/** The card's text: what is asked, in mrkdwn, without the buttons. */
+export function interactionText(i: ChatInteraction): string {
+  const p = i.payload;
+  const lines: string[] = [`*${interactionHeading(i)}*`];
+  if (i.title) lines.push(`*${i.title}*`);
+  switch (i.kind) {
+    case "request_confirmation":
+    case "request_checkbox_confirmation": {
+      if (str(p.prompt)) lines.push(str(p.prompt));
+      if (str(p.detailsMarkdown)) lines.push(markdownToMrkdwn(str(p.detailsMarkdown)));
+      const options = arr(p.options).map(rec);
+      if (options.length) lines.push(options.map((o) => `• ${str(o.label) || str(o.id)}`).join("\n"));
+      break;
+    }
+    case "ask_user_questions": {
+      const questions = arr(p.questions).map(rec);
+      questions.forEach((q, n) => {
+        lines.push(`${n + 1}. ${str(q.prompt) || str(q.header)}`);
+        const options = arr(q.options).map(rec);
+        if (options.length) lines.push(options.map((o) => `    • ${str(o.label) || str(o.id)}`).join("\n"));
+      });
+      break;
+    }
+    case "suggest_tasks": {
+      const tasks = arr(p.tasks).map(rec);
+      if (tasks.length) lines.push(tasks.map((t) => `• ${str(t.title)}`).join("\n"));
+      break;
+    }
+    default:
+      if (i.summary) lines.push(i.summary);
+  }
+  if (i.summary && i.kind !== "request_confirmation" && !lines.includes(i.summary)) lines.push(i.summary);
+  return lines.join("\n");
+}
+
+/** Block Kit for a pending interaction. */
+export function interactionBlocks(i: ChatInteraction, issueId: string, issueUrl: string): unknown[] {
+  const p = i.payload;
+  const blocks: unknown[] = [{ type: "section", text: { type: "mrkdwn", text: interactionText(i).slice(0, 2900) } }];
+  const value = `${issueId}:${i.id}`;
+  const elements: unknown[] = [];
+  if (i.kind === "request_confirmation" || i.kind === "request_checkbox_confirmation") {
+    elements.push(
+      { type: "button", text: { type: "plain_text", text: (str(p.acceptLabel) || "Accept").slice(0, 75) }, style: "primary", action_id: INTERACTION_ACTIONS.accept, value },
+      { type: "button", text: { type: "plain_text", text: (str(p.rejectLabel) || "Reject").slice(0, 75) }, style: "danger", action_id: INTERACTION_ACTIONS.reject, value },
+    );
+  }
+  elements.push({ type: "button", text: { type: "plain_text", text: elements.length ? "Open in Tandem" : "Answer in Tandem" }, url: issueUrl, action_id: "chat_interaction_open" });
+  blocks.push({ type: "actions", elements });
+  return blocks;
+}
+
+/** What a settled card says instead of its buttons. */
+export function interactionOutcome(i: ChatInteraction, by?: string): string {
+  const who = by ? ` by ${by}` : "";
+  switch (i.status) {
+    case "accepted":
+      return `✅ Accepted${who}`;
+    case "rejected":
+      return `❌ Rejected${who}`;
+    case "answered":
+      return `✅ Answered${who}`;
+    case "cancelled":
+      return "🚫 Withdrawn";
+    default:
+      return `Closed (${i.status})`;
+  }
+}
+
+/**
+ * Brings the thread's cards in line with the task's interactions: a pending
+ * one not yet shown gets a card; a shown one that settled elsewhere (in the
+ * web app, or by another person) has its buttons replaced by the outcome.
+ * Returns how many cards were posted or updated.
+ */
+export async function syncInteractions(deps: ChatTasksDeps, issueId: string): Promise<number> {
+  if (!deps.config.enabled) return 0;
+  const binding = await getIssueThread(deps.state, issueId);
+  if (!binding) return 0;
+  const interactions = await deps.issues.listInteractions(issueId);
+  let changed = 0;
+  for (const i of interactions) {
+    const key = CHAT_STATE_KEYS.interaction(i.id);
+    const card = (await deps.state.get(key)) as InteractionCard | null | undefined;
+    if (!card) {
+      if (i.status !== "pending") continue;
+      const text = interactionText(i);
+      const result = await deps.slack.postBlocks(binding.channel, text, interactionBlocks(i, issueId, deps.config.issueUrl(issueId)), binding.threadTs);
+      if (!result.ok || !result.ts) {
+        deps.log.warn("Slack interaction card failed", { issueId, interactionId: i.id, error: result.error });
+        continue;
+      }
+      await deps.state.set(key, { ts: result.ts, status: "pending" } satisfies InteractionCard);
+      changed += 1;
+      continue;
+    }
+    if (card.status === i.status || i.status === "pending") continue;
+    const text = `${interactionText(i)}\n\n${interactionOutcome(i)}`;
+    const result = await deps.slack.updateMessage(binding.channel, card.ts, text, [{ type: "section", text: { type: "mrkdwn", text: text.slice(0, 2900) } }]);
+    if (!result.ok) {
+      deps.log.warn("Slack interaction card update failed", { issueId, interactionId: i.id, error: result.error });
+      continue;
+    }
+    await deps.state.set(key, { ts: card.ts, status: i.status } satisfies InteractionCard);
+    changed += 1;
+  }
+  return changed;
+}
+
+/** Runs syncInteractions over every bound task; the poll's body. */
+export async function syncAllInteractions(deps: ChatTasksDeps): Promise<number> {
+  let changed = 0;
+  for (const issueId of await listBoundIssues(deps.state)) {
+    try {
+      changed += await syncInteractions(deps, issueId);
+    } catch (err) {
+      deps.log.warn("interaction sync failed", { issueId, err: String(err) });
+    }
+  }
+  return changed;
+}
+
+/**
+ * Handles a click on a card's Accept or Reject. Returns the text the card
+ * should show now; the caller replaces the card with it through Slack's
+ * response_url.
+ */
+export async function handleInteractionAction(
+  deps: ChatTasksDeps,
+  input: { value: string; action: "accept" | "reject"; slackUserId?: string },
+): Promise<{ ok: boolean; text: string }> {
+  const [issueId, interactionId] = input.value.split(":");
+  if (!issueId || !interactionId) return { ok: false, text: "This button no longer points at a task." };
+  const interactions = await deps.issues.listInteractions(issueId);
+  const current = interactions.find((i) => i.id === interactionId);
+  if (!current) return { ok: false, text: "This request is gone." };
+  if (current.status !== "pending") {
+    const text = `${interactionText(current)}\n\n${interactionOutcome(current)}`;
+    await deps.state.set(CHAT_STATE_KEYS.interaction(interactionId), { ts: "", status: current.status } satisfies InteractionCard);
+    return { ok: true, text };
+  }
+  let applied = false;
+  try {
+    applied = (await deps.issues.respondInteraction(issueId, interactionId, input.action)).applied;
+  } catch (err) {
+    deps.log.warn("respondInteraction failed", { issueId, interactionId, err: String(err) });
+    return { ok: false, text: `${interactionText(current)}\n\n⚠️ Could not record the answer: ${String(err).slice(0, 200)}` };
+  }
+  const settled: ChatInteraction = { ...current, status: input.action === "accept" ? "accepted" : "rejected" };
+  const by = input.slackUserId ? `<@${input.slackUserId}>` : undefined;
+  const text = `${interactionText(settled)}\n\n${interactionOutcome(settled, by)}${applied ? "" : " (recorded, not applied)"}`;
+  const card = (await deps.state.get(CHAT_STATE_KEYS.interaction(interactionId))) as InteractionCard | null | undefined;
+  await deps.state.set(CHAT_STATE_KEYS.interaction(interactionId), { ts: card?.ts ?? "", status: settled.status } satisfies InteractionCard);
+  return { ok: true, text };
 }

@@ -7,8 +7,16 @@ import {
   handleIssueCommentCreated,
   handleIssueStatusChanged,
   handleRunLifecycle,
+  handleInteractionAction,
+  interactionBlocks,
+  interactionText,
+  syncInteractions,
+  syncAllInteractions,
+  listBoundIssues,
   markdownToMrkdwn,
+  INTERACTION_ACTIONS,
   WORKING_STATUS,
+  type ChatInteraction,
   stripMention,
   type ChatTasksDeps,
 } from "../src/chat-tasks.js";
@@ -25,6 +33,10 @@ function makeDeps(overrides: Partial<ChatTasksDeps["config"]> = {}) {
   const removed: Array<{ channel: string; ts: string; name: string }> = [];
   const statuses: Array<{ channel: string; threadTs: string; status: string }> = [];
   let statusSupported = true;
+  const blockPosts: Array<{ channel: string; text: string; blocks: unknown[]; threadTs?: string }> = [];
+  const updates: Array<{ channel: string; ts: string; text: string }> = [];
+  const interactions = new Map<string, ChatInteraction[]>();
+  const responses: Array<{ issueId: string; interactionId: string; action: string }> = [];
   let issueSeq = 0;
   let commentSeq = 0;
   const issueComments = new Map<string, Array<{ id: string; body: string; authorType: string }>>();
@@ -50,6 +62,13 @@ function makeDeps(overrides: Partial<ChatTasksDeps["config"]> = {}) {
       },
       requestWakeup: async (issueId) => void wakeups.push(issueId),
       listComments: async (issueId) => issueComments.get(issueId) ?? [],
+      listInteractions: async (issueId) => interactions.get(issueId) ?? [],
+      respondInteraction: async (issueId, interactionId, action) => {
+        responses.push({ issueId, interactionId, action });
+        const i = (interactions.get(issueId) ?? []).find((x) => x.id === interactionId);
+        if (i) i.status = action === "accept" ? "accepted" : "rejected";
+        return { applied: true };
+      },
     },
     slack: {
       postMessage: async (channel, text, threadTs) => {
@@ -61,6 +80,14 @@ function makeDeps(overrides: Partial<ChatTasksDeps["config"]> = {}) {
       setThreadStatus: async (channel, threadTs, status) => {
         statuses.push({ channel, threadTs, status });
         return statusSupported;
+      },
+      postBlocks: async (channel, text, blocks, threadTs) => {
+        blockPosts.push({ channel, text, blocks, threadTs });
+        return { ok: true, ts: `card-${blockPosts.length}` };
+      },
+      updateMessage: async (channel, ts, text) => {
+        updates.push({ channel, ts, text });
+        return { ok: true };
       },
     },
     config: {
@@ -77,6 +104,7 @@ function makeDeps(overrides: Partial<ChatTasksDeps["config"]> = {}) {
   };
   return {
     deps, store, created, comments, wakeups, posts, reactions, removed, statuses, issueComments,
+    blockPosts, updates, interactions, responses,
     setStatusSupported: (v: boolean) => { statusSupported = v; },
   };
 }
@@ -275,5 +303,90 @@ describe("run lifecycle: the thread's status, not a message", () => {
     await handleIssueStatusChanged(env.deps, { issueId: "issue-1", status: "done" });
     expect(env.statuses.at(-1)!.status).toBe("");
     expect(env.posts.at(-1)!.text).toContain("✅");
+  });
+});
+
+describe("interactions: cards in the thread", () => {
+  const confirm: ChatInteraction = {
+    id: "int-1",
+    kind: "request_confirmation",
+    status: "pending",
+    title: "Deploy to staging?",
+    payload: { prompt: "I will deploy build 42 to staging.", acceptLabel: "Deploy", rejectLabel: "Hold" },
+  };
+  const questions: ChatInteraction = {
+    id: "int-2",
+    kind: "ask_user_questions",
+    status: "pending",
+    payload: { questions: [{ id: "q1", prompt: "Which region?", options: [{ id: "eu", label: "EU" }, { id: "us", label: "US" }] }] },
+  };
+
+  async function bound() {
+    const env = makeDeps();
+    await handleInboundMessage(env.deps, { type: "message", channel: "C1", user: "U1", text: `<@${BOT}> start`, ts: "100.1" });
+    return env;
+  }
+
+  it("renders a confirmation with accept and reject buttons carrying issue and interaction ids", () => {
+    const blocks = interactionBlocks(confirm, "issue-1", "https://pc.example/issues/issue-1") as Array<Record<string, any>>;
+    expect(interactionText(confirm)).toContain("Deploy to staging?");
+    expect(interactionText(confirm)).toContain("I will deploy build 42 to staging.");
+    const buttons = blocks[1]!.elements as Array<Record<string, any>>;
+    expect(buttons.map((b) => b.action_id)).toEqual([INTERACTION_ACTIONS.accept, INTERACTION_ACTIONS.reject, "chat_interaction_open"]);
+    expect(buttons[0]!.value).toBe("issue-1:int-1");
+    expect(buttons[0]!.text.text).toBe("Deploy");
+  });
+
+  it("renders questions with their options and only a link to answer", () => {
+    const text = interactionText(questions);
+    expect(text).toContain("1. Which region?");
+    expect(text).toContain("• EU");
+    const blocks = interactionBlocks(questions, "issue-1", "https://pc.example/issues/issue-1") as Array<Record<string, any>>;
+    const buttons = blocks[1]!.elements as Array<Record<string, any>>;
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0]!.text.text).toBe("Answer in Tandem");
+    expect(buttons[0]!.url).toBe("https://pc.example/issues/issue-1");
+  });
+
+  it("posts a card once per pending interaction and updates it when it settles elsewhere", async () => {
+    const env = await bound();
+    env.interactions.set("issue-1", [{ ...confirm }, { ...questions }]);
+    expect(await syncInteractions(env.deps, "issue-1")).toBe(2);
+    expect(env.blockPosts).toHaveLength(2);
+    expect(env.blockPosts[0]).toMatchObject({ channel: "C1", threadTs: "100.1" });
+    // Nothing new: nothing posted again.
+    expect(await syncInteractions(env.deps, "issue-1")).toBe(0);
+    expect(env.blockPosts).toHaveLength(2);
+    // Answered in the web app: the card loses its buttons and says so.
+    env.interactions.get("issue-1")![1]!.status = "answered";
+    expect(await syncInteractions(env.deps, "issue-1")).toBe(1);
+    expect(env.updates.at(-1)).toMatchObject({ ts: "card-2" });
+    expect(env.updates.at(-1)!.text).toContain("✅ Answered");
+    // The poll covers every bound task.
+    expect(await listBoundIssues(env.deps.state)).toEqual(["issue-1"]);
+    expect(await syncAllInteractions(env.deps)).toBe(0);
+  });
+
+  it("accept and reject buttons answer the interaction and say who did it", async () => {
+    const env = await bound();
+    env.interactions.set("issue-1", [{ ...confirm }]);
+    await syncInteractions(env.deps, "issue-1");
+    const outcome = await handleInteractionAction(env.deps, { value: "issue-1:int-1", action: "accept", slackUserId: "U7" });
+    expect(outcome.ok).toBe(true);
+    expect(env.responses).toEqual([{ issueId: "issue-1", interactionId: "int-1", action: "accept" }]);
+    expect(outcome.text).toContain("✅ Accepted by <@U7>");
+    // A second click on a settled card answers nothing and shows the outcome.
+    const again = await handleInteractionAction(env.deps, { value: "issue-1:int-1", action: "reject", slackUserId: "U8" });
+    expect(env.responses).toHaveLength(1);
+    expect(again.text).toContain("✅ Accepted");
+    // Junk values are refused politely.
+    expect((await handleInteractionAction(env.deps, { value: "nope", action: "accept" })).ok).toBe(false);
+  });
+
+  it("does nothing for tasks without a thread", async () => {
+    const env = makeDeps();
+    env.interactions.set("issue-9", [{ ...confirm }]);
+    expect(await syncInteractions(env.deps, "issue-9")).toBe(0);
+    expect(env.blockPosts).toHaveLength(0);
   });
 });

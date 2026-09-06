@@ -8,12 +8,16 @@ import {
   type PluginHealthDiagnostics,
 } from "@paperclipai/plugin-sdk";
 import { WEBHOOK_KEYS, STATE_KEYS, PLUGIN_ID } from "./constants.js";
-import { postMessage, respondToAction, respondEphemeral, addReaction, removeReaction, setThreadStatus, authTest, setSlackApiBase } from "./slack-api.js";
+import { postMessage, updateMessage, respondToAction, respondEphemeral, addReaction, removeReaction, setThreadStatus, authTest, setSlackApiBase } from "./slack-api.js";
 import {
   handleInboundMessage,
   handleIssueCommentCreated,
   handleIssueStatusChanged,
   handleRunLifecycle,
+  handleInteractionAction,
+  syncAllInteractions,
+  syncInteractions,
+  INTERACTION_ACTIONS,
   type ChatTasksDeps,
   type RunLifecycle,
   type SlackMessageEvent,
@@ -75,6 +79,9 @@ let slackSigningSecret: string | null = null;
 // The bot's own user id, learned from auth.test at startup; without it a
 // mention cannot be recognised and the bot would answer its own messages.
 let botUserId: string | undefined;
+// The interaction poll; the host raises no event for interactions.
+let interactionPoll: ReturnType<typeof setInterval> | undefined;
+const INTERACTION_POLL_MS = 20_000;
 
 // --- Chat tasks (one task = one thread) ---
 
@@ -113,6 +120,21 @@ async function buildChatDeps(ctx: PluginContext, companyId: string): Promise<Cha
         const comments = await ctx.issues.listComments(issueId, companyId);
         return comments.map((c) => ({ id: c.id, body: c.body, authorType: String(c.authorType) }));
       },
+      listInteractions: async (issueId) => {
+        const list = await ctx.issues.listInteractions(issueId, companyId);
+        return list.map((i) => ({
+          id: i.id,
+          kind: String(i.kind),
+          status: String(i.status),
+          title: i.title ?? null,
+          summary: i.summary ?? null,
+          payload: ((i as unknown as { payload?: unknown }).payload ?? {}) as Record<string, unknown>,
+        }));
+      },
+      respondInteraction: async (issueId, interactionId, action) => {
+        const result = await ctx.issues.respondInteraction(issueId, interactionId, { action }, companyId);
+        return { applied: result.applied };
+      },
     },
     slack: {
       postMessage: (channel, text, threadTs) =>
@@ -123,6 +145,10 @@ async function buildChatDeps(ctx: PluginContext, companyId: string): Promise<Cha
       removeReaction: async (channel, ts, name) => {
         await removeReaction(ctx, pluginToken, channel, ts, name);
       },
+      postBlocks: (channel, text, blocks, threadTs) =>
+        postMessage(ctx, pluginToken, channel, { text, blocks: blocks as SlackMessage["blocks"] }, threadTs ? { threadTs } : undefined),
+      updateMessage: (channel, ts, text, blocks) =>
+        updateMessage(ctx, pluginToken, channel, ts, { text, blocks: blocks as SlackMessage["blocks"] }),
       setThreadStatus: async (channel, threadTs, status) => {
         const result = await setThreadStatus(ctx, pluginToken, channel, threadTs, status);
         if (!result.ok && result.error !== "missing_scope" && result.error !== "not_allowed" && result.error !== "invalid_arguments") {
@@ -976,7 +1002,26 @@ const plugin = definePlugin({
       if (!event.entityId || !commentId) return;
       const deps = await buildChatDeps(ctx, event.companyId);
       await handleIssueCommentCreated(deps, { issueId: event.entityId, commentId });
+      // An agent's question usually arrives with a comment; look right away
+      // rather than waiting for the poll.
+      await syncInteractions(deps, event.entityId);
     });
+
+    // The host raises no event when an interaction is created or settled
+    // elsewhere, so bound tasks are polled.
+    if (interactionPoll) clearInterval(interactionPoll);
+    interactionPoll = setInterval(() => {
+      void (async () => {
+        try {
+          const companyId = setupCompanyId ?? (await chatCompanyId(ctx));
+          if (!companyId) return;
+          await syncAllInteractions(await buildChatDeps(ctx, companyId));
+        } catch (err) {
+          ctx.logger.warn("interaction poll failed", { err: String(err) });
+        }
+      })();
+    }, INTERACTION_POLL_MS);
+    interactionPoll.unref?.();
 
     ctx.events.on("approval.created", async (event: PluginEvent) => {
       const live = await getConfig();
@@ -1500,6 +1545,22 @@ const plugin = definePlugin({
 
       const companies = await pluginCtx.companies.list({ limit: 1, offset: 0 });
       const companyId = companies[0]?.id ?? "";
+
+      // --- Interaction cards in task threads ---
+      if (actionId === INTERACTION_ACTIONS.accept || actionId === INTERACTION_ACTIONS.reject) {
+        const deps = await buildChatDeps(pluginCtx, companyId);
+        const outcome = await handleInteractionAction(deps, {
+          value: actionValue,
+          action: actionId === INTERACTION_ACTIONS.accept ? "accept" : "reject",
+          slackUserId: userId !== "unknown" ? userId : undefined,
+        });
+        await respondToAction(pluginCtx, pluginToken, responseUrl, {
+          text: outcome.text,
+          blocks: [{ type: "section", text: { type: "mrkdwn", text: outcome.text.slice(0, 2900) } }],
+        });
+        await pluginCtx.metrics.write("slack.chat.interactions", 1, { action: actionId, ok: String(outcome.ok) });
+        return;
+      }
 
       // --- Approval buttons ---
       if (actionId === "approval_approve" || actionId === "approval_reject") {
