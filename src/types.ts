@@ -24,6 +24,7 @@ export type SlackConfig = {
   chatRequireMention: boolean;
   chatAckReaction: string;
   chatWorkingReaction: string;
+  chatPairings?: Record<string, string>;
 };
 
 // --- Session registry types ---

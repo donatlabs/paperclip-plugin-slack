@@ -24,6 +24,7 @@ const manifest: PaperclipPluginManifestV1 = {
     "issues.wakeup",
     "issue.comments.read",
     "issue.comments.create",
+    "issue.comments.create_human_attributed",
     "issue.interactions.read",
     "issue.interactions.respond",
     "agents.read",
@@ -184,6 +185,13 @@ const manifest: PaperclipPluginManifestV1 = {
         title: "Working reaction",
         description: "Emoji name shown on the task's message while an agent works on it, where Slack cannot show a thread status. Empty disables it.",
         default: DEFAULT_CONFIG.chatWorkingReaction,
+      },
+      chatPairings: {
+        type: "object",
+        title: "Slack users paired to Tandem users",
+        description: "Slack user id → Tandem user id. A paired person's replies are their own comments; written by the control plane, editable here.",
+        additionalProperties: { type: "string" },
+        default: {},
       },
       chatAckReaction: {
         type: "string",

@@ -18,7 +18,8 @@ export interface ChatStateStore {
 
 export interface ChatIssuesClient {
   create(input: { title: string; description: string; projectId?: string }): Promise<{ id: string; identifier: string | null }>;
-  createComment(issueId: string, body: string): Promise<{ id: string }>;
+  /** actorUserId attributes the comment to that Paperclip user; the host wakes the assignee for it. */
+  createComment(issueId: string, body: string, options?: { actorUserId?: string }): Promise<{ id: string }>;
   requestWakeup(issueId: string, reason: string): Promise<void>;
   listComments(issueId: string): Promise<Array<{ id: string; body: string; authorType: string }>>;
   listInteractions(issueId: string): Promise<ChatInteraction[]>;
@@ -53,6 +54,8 @@ export interface ChatTasksConfig {
   ackReaction: string;
   /** Reaction that stands in for the thread status where Slack cannot show one. */
   workingReaction: string;
+  /** Slack user id -> Paperclip user id, for comments attributed to the person rather than the bot. */
+  pairings: Record<string, string>;
   issueUrl(issueId: string): string;
 }
 
@@ -255,10 +258,7 @@ export async function handleInboundMessage(deps: ChatTasksDeps, event: SlackMess
     const issueId = await getThreadIssue(deps.state, channel, threadRoot);
     if (issueId) {
       if (!text) return { kind: "ignored", reason: "empty" };
-      const comment = await deps.issues.createComment(issueId, formatInboundComment(text, event.user));
-      await rememberInRollingList(deps.state, CHAT_STATE_KEYS.ownComments, comment.id, OWN_COMMENTS_WINDOW);
-      // A plugin-authored comment never wakes the assignee on its own.
-      await deps.issues.requestWakeup(issueId, "slack_reply");
+      const comment = await relayComment(deps, issueId, text, event.user);
       deps.log.info("Slack reply relayed as comment", { channel, threadRoot, issueId, commentId: comment.id });
       return { kind: "commented", issueId, commentId: comment.id };
     }
@@ -296,6 +296,32 @@ async function createTaskForThread(
   }
   deps.log.info("Slack mention created task", { channel: input.channel, threadTs: input.threadTs, issueId: issue.id });
   return { kind: "created", issueId: issue.id };
+}
+
+/**
+ * Writes a Slack reply as a comment. A sender paired to a Paperclip user is
+ * that user: the comment is theirs and the host wakes the assignee as for
+ * any comment from the web app. Anyone else is relayed under the plugin's
+ * identity with their Slack handle, and the assignee is woken by hand.
+ */
+async function relayComment(deps: ChatTasksDeps, issueId: string, text: string, slackUserId: string | undefined): Promise<{ id: string }> {
+  const paired = slackUserId ? deps.config.pairings[slackUserId] : undefined;
+  if (paired) {
+    try {
+      const comment = await deps.issues.createComment(issueId, text, { actorUserId: paired });
+      await rememberInRollingList(deps.state, CHAT_STATE_KEYS.ownComments, comment.id, OWN_COMMENTS_WINDOW);
+      return comment;
+    } catch (err) {
+      // The pairing names someone the host no longer accepts (left the
+      // company, or the capability is missing); fall through to the relay.
+      deps.log.warn("human-attributed comment refused; relaying as the bot", { slackUserId, err: String(err) });
+    }
+  }
+  const comment = await deps.issues.createComment(issueId, formatInboundComment(text, slackUserId));
+  await rememberInRollingList(deps.state, CHAT_STATE_KEYS.ownComments, comment.id, OWN_COMMENTS_WINDOW);
+  // A plugin-authored comment never wakes the assignee on its own.
+  await deps.issues.requestWakeup(issueId, "slack_reply");
+  return comment;
 }
 
 export function formatInboundComment(text: string, slackUserId: string | undefined): string {
