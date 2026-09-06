@@ -12,9 +12,12 @@ export async function resolveStartupSlackToken(
   ctx: PluginContext,
   tokenRef: string,
   setHealth: (health: SlackRuntimeHealth) => void,
+  companyId?: string,
 ): Promise<string | undefined> {
   try {
-    const token = await ctx.secrets.resolve(tokenRef);
+    // The host resolves a plugin's secret only for a company and, when the
+    // same secret sits at several paths, only for a named config path.
+    const token = await ctx.secrets.resolve(tokenRef, { companyId, configPath: "slackTokenRef" });
     setHealth({ status: "ok" });
     return token;
   } catch (err) {
