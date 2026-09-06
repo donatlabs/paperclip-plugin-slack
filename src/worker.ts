@@ -81,7 +81,7 @@ async function chatCompanyId(ctx: PluginContext): Promise<string | undefined> {
 }
 
 async function buildChatDeps(ctx: PluginContext, companyId: string): Promise<ChatTasksDeps> {
-  const config = (await ctx.config.get()) as unknown as SlackConfig;
+  const config = (await ctx.config.get(companyId)) as unknown as SlackConfig;
   const base = (config.paperclipBaseUrl || "http://localhost:3100").replace(/\/+$/, "");
   const scope = (stateKey: string) => ({ scopeKind: "company" as const, scopeId: companyId, stateKey });
   return {
@@ -453,13 +453,17 @@ async function handleApproveCommand(ctx: PluginContext, responseUrl: string, app
 
 const plugin = definePlugin({
   async setup(ctx) {
-    const rawConfig = await ctx.config.get();
+    // Config is per company on the host; outside a company-scoped call the
+    // host cannot derive one, so the plugin names the company it serves.
+    // There is one per instance in the deployments this fork targets.
+    const setupCompanyId = await chatCompanyId(ctx);
+    const rawConfig = await ctx.config.get(setupCompanyId);
     const config = rawConfig as unknown as SlackConfig;
     // Always reads the current persisted config so flag changes (e.g.
     // toggling notifyOnAgentConnected) take effect without restarting the
     // plugin worker.
     const getConfig = async (): Promise<SlackConfig> =>
-      (await ctx.config.get()) as unknown as SlackConfig;
+      (await ctx.config.get(setupCompanyId)) as unknown as SlackConfig;
 
     pluginCtx = ctx;
     pluginConfig = config;
