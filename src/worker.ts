@@ -482,7 +482,7 @@ const plugin = definePlugin({
 
     const token = await resolveStartupSlackToken(ctx, config.slackTokenRef, (health) => {
       runtimeHealth = health;
-    });
+    }, setupCompanyId);
     if (!token) {
       ctx.logger.warn("Slack plugin runtime disabled because Slack token could not be resolved");
       return;
@@ -503,7 +503,7 @@ const plugin = definePlugin({
     // Resolve Slack signing secret for webhook signature verification
     if (config.slackSigningSecretRef) {
       try {
-        slackSigningSecret = await ctx.secrets.resolve(config.slackSigningSecretRef);
+        slackSigningSecret = await ctx.secrets.resolve(config.slackSigningSecretRef, { companyId: setupCompanyId, configPath: "slackSigningSecretRef" });
       } catch {
         ctx.logger.warn("Slack signing secret not configured — webhook signature verification disabled");
       }
