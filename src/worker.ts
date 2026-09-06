@@ -1718,13 +1718,11 @@ const plugin = definePlugin({
     return { ok: true };
   },
 
-  async onConfigChanged(newConfig: Record<string, unknown>): Promise<void> {
-    const url = newConfig.slackApiBaseUrl;
-    if (typeof url === "string" && url) setSlackApiBase(url);
-    const base = newConfig.paperclipBaseUrl;
-    if (typeof base === "string" && base) setBaseUrl(base);
-    pluginConfig = newConfig as unknown as SlackConfig;
-  },
+  // No onConfigChanged on purpose: the host restarts the worker when a
+  // config is saved and the worker does not take it live, and a restart is
+  // the one way a worker that started unconfigured (setup-config.ts) gets
+  // its token, its bot identity and its chat tasks. Connecting Slack on a
+  // hosted workspace writes the config after the worker is up.
 
   async onHealth(): Promise<PluginHealthDiagnostics> {
     return runtimeHealth;
