@@ -8,12 +8,14 @@ import {
   type PluginHealthDiagnostics,
 } from "@paperclipai/plugin-sdk";
 import { WEBHOOK_KEYS, STATE_KEYS, PLUGIN_ID } from "./constants.js";
-import { postMessage, respondToAction, respondEphemeral, addReaction, authTest, setSlackApiBase } from "./slack-api.js";
+import { postMessage, respondToAction, respondEphemeral, addReaction, removeReaction, setThreadStatus, authTest, setSlackApiBase } from "./slack-api.js";
 import {
   handleInboundMessage,
   handleIssueCommentCreated,
   handleIssueStatusChanged,
+  handleRunLifecycle,
   type ChatTasksDeps,
+  type RunLifecycle,
   type SlackMessageEvent,
 } from "./chat-tasks.js";
 import type { SlackMessage } from "./slack-api.js";
@@ -118,12 +120,23 @@ async function buildChatDeps(ctx: PluginContext, companyId: string): Promise<Cha
       addReaction: async (channel, ts, name) => {
         await addReaction(ctx, pluginToken, channel, ts, name);
       },
+      removeReaction: async (channel, ts, name) => {
+        await removeReaction(ctx, pluginToken, channel, ts, name);
+      },
+      setThreadStatus: async (channel, threadTs, status) => {
+        const result = await setThreadStatus(ctx, pluginToken, channel, threadTs, status);
+        if (!result.ok && result.error !== "missing_scope" && result.error !== "not_allowed" && result.error !== "invalid_arguments") {
+          ctx.logger.warn("Slack assistant.threads.setStatus failed", { error: result.error, channel });
+        }
+        return result.ok;
+      },
     },
     config: {
       enabled: config.chatTasksEnabled !== false,
       requireMention: config.chatRequireMention !== false,
       projectId: config.chatTasksProjectId || undefined,
       ackReaction: config.chatAckReaction ?? "eyes",
+      workingReaction: config.chatWorkingReaction ?? "gear",
       issueUrl: (issueId) => `${base}/issues/${issueId}`,
     },
     botUserId,
@@ -932,6 +945,30 @@ const plugin = definePlugin({
       }) as string | null;
       await notify(event, formatIssueDone, undefined, threadTs ? { threadTs } : undefined);
     });
+
+    // An agent run on a task that lives in a thread is shown there as the
+    // thread's status, and a failure as one line.
+    const runLifecycle: Record<string, RunLifecycle> = {
+      "agent.run.started": "started",
+      "agent.run.finished": "finished",
+      "agent.run.failed": "failed",
+      "agent.run.cancelled": "cancelled",
+    };
+    for (const [eventType, state] of Object.entries(runLifecycle)) {
+      ctx.events.on(eventType as "agent.run.started", async (event: PluginEvent) => {
+        const payload = event.payload as Record<string, unknown>;
+        const issueId = typeof payload.issueId === "string" ? payload.issueId : "";
+        const runId = typeof payload.runId === "string" ? payload.runId : event.entityId ?? "";
+        if (!issueId) return;
+        const deps = await buildChatDeps(ctx, event.companyId);
+        await handleRunLifecycle(deps, {
+          issueId,
+          runId,
+          state,
+          error: typeof payload.error === "string" ? payload.error : undefined,
+        });
+      });
+    }
 
     ctx.events.on("issue.comment.created", async (event: PluginEvent) => {
       const payload = event.payload as Record<string, unknown>;

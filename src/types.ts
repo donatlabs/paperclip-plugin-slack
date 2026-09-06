@@ -23,6 +23,7 @@ export type SlackConfig = {
   chatTasksProjectId: string;
   chatRequireMention: boolean;
   chatAckReaction: string;
+  chatWorkingReaction: string;
 };
 
 // --- Session registry types ---

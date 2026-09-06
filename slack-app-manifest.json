@@ -23,6 +23,7 @@
         "chat:write.customize",
         "reactions:read",
         "reactions:write",
+        "assistant:write",
         "users:read",
         "files:read"
       ]

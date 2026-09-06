@@ -177,6 +177,12 @@ const manifest: PaperclipPluginManifestV1 = {
         description: "When off, every top-level message in a channel the bot is in becomes a task. Keep on for shared channels.",
         default: DEFAULT_CONFIG.chatRequireMention,
       },
+      chatWorkingReaction: {
+        type: "string",
+        title: "Working reaction",
+        description: "Emoji name shown on the task's message while an agent works on it, where Slack cannot show a thread status. Empty disables it.",
+        default: DEFAULT_CONFIG.chatWorkingReaction,
+      },
       chatAckReaction: {
         type: "string",
         title: "Ack reaction",
