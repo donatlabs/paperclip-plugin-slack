@@ -8,7 +8,14 @@ import {
   type PluginHealthDiagnostics,
 } from "@paperclipai/plugin-sdk";
 import { WEBHOOK_KEYS, STATE_KEYS, PLUGIN_ID } from "./constants.js";
-import { postMessage, respondToAction, respondEphemeral } from "./slack-api.js";
+import { postMessage, respondToAction, respondEphemeral, addReaction, authTest, setSlackApiBase } from "./slack-api.js";
+import {
+  handleInboundMessage,
+  handleIssueCommentCreated,
+  handleIssueStatusChanged,
+  type ChatTasksDeps,
+  type SlackMessageEvent,
+} from "./chat-tasks.js";
 import type { SlackMessage } from "./slack-api.js";
 import type { SlackConfig, EscalationRecord, CommandDefinition, SessionEntry } from "./types.js";
 import { SlackAdapter } from "./adapter.js";
@@ -62,6 +69,66 @@ let runtimeHealth: SlackRuntimeHealth = { status: "ok" };
 // --- Slack signature verification ---
 
 let slackSigningSecret: string | null = null;
+// The bot's own user id, learned from auth.test at startup; without it a
+// mention cannot be recognised and the bot would answer its own messages.
+let botUserId: string | undefined;
+
+// --- Chat tasks (one task = one thread) ---
+
+async function chatCompanyId(ctx: PluginContext): Promise<string | undefined> {
+  const companies = await ctx.companies.list({ limit: 1, offset: 0 });
+  return companies[0]?.id;
+}
+
+async function buildChatDeps(ctx: PluginContext, companyId: string): Promise<ChatTasksDeps> {
+  const config = (await ctx.config.get()) as unknown as SlackConfig;
+  const base = (config.paperclipBaseUrl || "http://localhost:3100").replace(/\/+$/, "");
+  const scope = (stateKey: string) => ({ scopeKind: "company" as const, scopeId: companyId, stateKey });
+  return {
+    state: {
+      get: (key) => ctx.state.get(scope(key)),
+      set: (key, value) => ctx.state.set(scope(key), value),
+    },
+    issues: {
+      create: async (input) => {
+        const issue = await ctx.issues.create({
+          companyId,
+          title: input.title,
+          description: input.description,
+          projectId: input.projectId,
+        });
+        return { id: issue.id, identifier: issue.identifier ?? null };
+      },
+      createComment: async (issueId, body) => {
+        const comment = await ctx.issues.createComment(issueId, body, companyId);
+        return { id: comment.id };
+      },
+      requestWakeup: async (issueId, reason) => {
+        await ctx.issues.requestWakeup(issueId, companyId, { reason, contextSource: "slack" });
+      },
+      listComments: async (issueId) => {
+        const comments = await ctx.issues.listComments(issueId, companyId);
+        return comments.map((c) => ({ id: c.id, body: c.body, authorType: String(c.authorType) }));
+      },
+    },
+    slack: {
+      postMessage: (channel, text, threadTs) =>
+        postMessage(ctx, pluginToken, channel, { text }, threadTs ? { threadTs } : undefined),
+      addReaction: async (channel, ts, name) => {
+        await addReaction(ctx, pluginToken, channel, ts, name);
+      },
+    },
+    config: {
+      enabled: config.chatTasksEnabled !== false,
+      requireMention: config.chatRequireMention !== false,
+      projectId: config.chatTasksProjectId || undefined,
+      ackReaction: config.chatAckReaction ?? "eyes",
+      issueUrl: (issueId) => `${base}/issues/${issueId}`,
+    },
+    botUserId,
+    log: ctx.logger,
+  };
+}
 
 function verifySlackSignature(
   headers: Record<string, string | string[]>,
@@ -400,6 +467,9 @@ const plugin = definePlugin({
     if (config.paperclipBaseUrl) {
       setBaseUrl(config.paperclipBaseUrl);
     }
+    if (config.slackApiBaseUrl) {
+      setSlackApiBase(config.slackApiBaseUrl);
+    }
 
     if (!config.slackTokenRef) {
       ctx.logger.warn("No slackTokenRef configured, notifications disabled");
@@ -414,6 +484,17 @@ const plugin = definePlugin({
       return;
     }
     pluginToken = token;
+
+    try {
+      const identity = await authTest(ctx, token);
+      if (identity.ok && identity.user_id) {
+        botUserId = identity.user_id;
+      } else {
+        ctx.logger.warn("Slack auth.test failed; mentions cannot be recognised", { error: identity.error });
+      }
+    } catch (err) {
+      ctx.logger.warn("Slack auth.test unreachable; mentions cannot be recognised", { err: String(err) });
+    }
 
     // Resolve Slack signing secret for webhook signature verification
     if (config.slackSigningSecretRef) {
@@ -824,16 +905,35 @@ const plugin = definePlugin({
     });
 
     ctx.events.on("issue.updated", async (event: PluginEvent) => {
-      const live = await getConfig();
-      if (!live.notifyOnIssueDone) return;
       const payload = event.payload as Record<string, unknown>;
       if (payload.status !== "done") return;
+      // A task that lives in a Slack thread is announced there, not in the
+      // notifications channel.
+      if (event.entityId) {
+        const deps = await buildChatDeps(ctx, event.companyId);
+        const announced = await handleIssueStatusChanged(deps, {
+          issueId: event.entityId,
+          status: "done",
+          title: typeof payload.title === "string" ? payload.title : undefined,
+        });
+        if (announced) return;
+      }
+      const live = await getConfig();
+      if (!live.notifyOnIssueDone) return;
       const threadTs = await ctx.state.get({
         scopeKind: "company",
         scopeId: event.companyId,
         stateKey: STATE_KEYS.threadIssue(event.entityId ?? ""),
       }) as string | null;
       await notify(event, formatIssueDone, undefined, threadTs ? { threadTs } : undefined);
+    });
+
+    ctx.events.on("issue.comment.created", async (event: PluginEvent) => {
+      const payload = event.payload as Record<string, unknown>;
+      const commentId = typeof payload.commentId === "string" ? payload.commentId : "";
+      if (!event.entityId || !commentId) return;
+      const deps = await buildChatDeps(ctx, event.companyId);
+      await handleIssueCommentCreated(deps, { issueId: event.entityId, commentId });
     });
 
     ctx.events.on("approval.created", async (event: PluginEvent) => {
@@ -1308,6 +1408,15 @@ const plugin = definePlugin({
       // Handle file_shared events for Phase 3 media pipeline
       if (body?.type === "event_callback") {
         const event = body.event as Record<string, unknown> | undefined;
+        if (event?.type === "message" || event?.type === "app_mention") {
+          const companyId = await chatCompanyId(pluginCtx);
+          if (companyId && pluginToken) {
+            const deps = await buildChatDeps(pluginCtx, companyId);
+            const outcome = await handleInboundMessage(deps, event as unknown as SlackMessageEvent);
+            await pluginCtx.metrics.write("slack.chat.inbound", 1, { outcome: outcome.kind });
+          }
+          return;
+        }
         if (event?.type === "file_shared") {
           const companies = await pluginCtx.companies.list({ limit: 1, offset: 0 });
           const companyId = companies[0]?.id ?? "";
@@ -1493,6 +1602,14 @@ const plugin = definePlugin({
       return { ok: false, errors: ["defaultChannelId is required"] };
     }
     return { ok: true };
+  },
+
+  async onConfigChanged(newConfig: Record<string, unknown>): Promise<void> {
+    const url = newConfig.slackApiBaseUrl;
+    if (typeof url === "string" && url) setSlackApiBase(url);
+    const base = newConfig.paperclipBaseUrl;
+    if (typeof base === "string" && base) setBaseUrl(base);
+    pluginConfig = newConfig as unknown as SlackConfig;
   },
 
   async onHealth(): Promise<PluginHealthDiagnostics> {

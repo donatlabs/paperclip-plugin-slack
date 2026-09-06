@@ -13,7 +13,17 @@ export interface SlackMessage {
   blocks?: Array<SlackBlock | Record<string, unknown>>;
 }
 
-const SLACK_API_BASE = "https://slack.com/api";
+let slackApiBase = "https://slack.com/api";
+
+/** Points every Web API call at another host, e.g. a token-injecting proxy. */
+export function setSlackApiBase(url: string): void {
+  const trimmed = url.trim().replace(/\/+$/, "");
+  if (trimmed) slackApiBase = trimmed;
+}
+
+export function getSlackApiBase(): string {
+  return slackApiBase;
+}
 const MAX_RETRIES = 3;
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503]);
 
@@ -56,7 +66,7 @@ export async function postMessage(
     payload.thread_ts = opts.threadTs;
   }
 
-  const response = await fetchWithRetry(ctx, `${SLACK_API_BASE}/chat.postMessage`, {
+  const response = await fetchWithRetry(ctx, `${slackApiBase}/chat.postMessage`, {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${token}`,
@@ -90,7 +100,7 @@ export async function updateMessage(
     payload.blocks = message.blocks;
   }
 
-  const response = await fetchWithRetry(ctx, `${SLACK_API_BASE}/chat.update`, {
+  const response = await fetchWithRetry(ctx, `${slackApiBase}/chat.update`, {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${token}`,
@@ -155,7 +165,7 @@ export async function getFileInfo(
   token: string,
   fileId: string,
 ): Promise<{ url: string; mimetype: string; name: string } | null> {
-  const response = await fetchWithRetry(ctx, `${SLACK_API_BASE}/files.info?file=${fileId}`, {
+  const response = await fetchWithRetry(ctx, `${slackApiBase}/files.info?file=${fileId}`, {
     method: "GET",
     headers: { "Authorization": `Bearer ${token}` },
   });
@@ -183,4 +193,43 @@ export async function downloadFile(
   });
   if (response.status !== 200) return null;
   return response.arrayBuffer();
+}
+
+export async function addReaction(
+  ctx: PluginContext,
+  token: string,
+  channelId: string,
+  ts: string,
+  name: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const response = await fetchWithRetry(ctx, `${slackApiBase}/reactions.add`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ channel: channelId, timestamp: ts, name }),
+  });
+  const body = await response.json() as { ok: boolean; error?: string };
+  // "already_reacted" is not a failure worth a log line.
+  if (!body.ok && body.error !== "already_reacted") {
+    ctx.logger.warn("Slack reactions.add failed", { error: body.error, channelId, ts });
+  }
+  return body;
+}
+
+/** Who the token is: needed to recognise the bot's own mention and messages. */
+export async function authTest(
+  ctx: PluginContext,
+  token: string,
+): Promise<{ ok: boolean; user_id?: string; team_id?: string; user?: string; error?: string }> {
+  const response = await fetchWithRetry(ctx, `${slackApiBase}/auth.test`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: "{}",
+  });
+  return await response.json() as { ok: boolean; user_id?: string; team_id?: string; user?: string; error?: string };
 }

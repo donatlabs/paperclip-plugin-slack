@@ -55,4 +55,12 @@ export const DEFAULT_CONFIG = {
   escalationHoldMessage: "Your request has been escalated to a human agent. Please hold.",
   paperclipBaseUrl: "http://localhost:3100",
   maxAgentsPerThread: 5,
+  // Slack Web API base. A hosted deployment points this at a proxy that
+  // holds the real bot token; the token in slackTokenRef is then a bearer
+  // for that proxy. The plugin does not know the difference.
+  slackApiBaseUrl: "https://slack.com/api",
+  chatTasksEnabled: true,
+  chatTasksProjectId: "",
+  chatRequireMention: true,
+  chatAckReaction: "eyes",
 } as const;

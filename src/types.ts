@@ -18,6 +18,11 @@ export type SlackConfig = {
   escalationHoldMessage: string;
   paperclipBaseUrl: string;
   maxAgentsPerThread: number;
+  slackApiBaseUrl: string;
+  chatTasksEnabled: boolean;
+  chatTasksProjectId: string;
+  chatRequireMention: boolean;
+  chatAckReaction: string;
 };
 
 // --- Session registry types ---

@@ -1,0 +1,212 @@
+import { describe, it, expect, beforeEach } from "vitest";
+import {
+  CHAT_STATE_KEYS,
+  chunkText,
+  extractTaskTitle,
+  handleInboundMessage,
+  handleIssueCommentCreated,
+  handleIssueStatusChanged,
+  markdownToMrkdwn,
+  stripMention,
+  type ChatTasksDeps,
+} from "../src/chat-tasks.js";
+
+const BOT = "UBOT";
+
+function makeDeps(overrides: Partial<ChatTasksDeps["config"]> = {}) {
+  const store = new Map<string, unknown>();
+  const created: Array<{ title: string; description: string; projectId?: string }> = [];
+  const comments: Array<{ issueId: string; body: string }> = [];
+  const wakeups: string[] = [];
+  const posts: Array<{ channel: string; text: string; threadTs?: string }> = [];
+  const reactions: Array<{ channel: string; ts: string; name: string }> = [];
+  let issueSeq = 0;
+  let commentSeq = 0;
+  const issueComments = new Map<string, Array<{ id: string; body: string; authorType: string }>>();
+  const deps: ChatTasksDeps = {
+    state: {
+      get: async (k) => store.get(k),
+      set: async (k, v) => void store.set(k, v),
+    },
+    issues: {
+      create: async (input) => {
+        created.push(input);
+        issueSeq += 1;
+        return { id: `issue-${issueSeq}`, identifier: `ACME-${issueSeq}` };
+      },
+      createComment: async (issueId, body) => {
+        comments.push({ issueId, body });
+        commentSeq += 1;
+        const id = `comment-${commentSeq}`;
+        const list = issueComments.get(issueId) ?? [];
+        list.push({ id, body, authorType: "agent" });
+        issueComments.set(issueId, list);
+        return { id };
+      },
+      requestWakeup: async (issueId) => void wakeups.push(issueId),
+      listComments: async (issueId) => issueComments.get(issueId) ?? [],
+    },
+    slack: {
+      postMessage: async (channel, text, threadTs) => {
+        posts.push({ channel, text, threadTs });
+        return { ok: true, ts: `${posts.length}.000` };
+      },
+      addReaction: async (channel, ts, name) => void reactions.push({ channel, ts, name }),
+    },
+    config: {
+      enabled: true,
+      requireMention: true,
+      projectId: "proj-1",
+      ackReaction: "eyes",
+      issueUrl: (id) => `https://pc.example/issues/${id}`,
+      ...overrides,
+    },
+    botUserId: BOT,
+    log: { info() {}, warn() {} },
+  };
+  return { deps, store, created, comments, wakeups, posts, reactions, issueComments };
+}
+
+describe("text helpers", () => {
+  it("strips the bot mention and keeps other mentions", () => {
+    expect(stripMention(`<@${BOT}> please review <@U2>'s PR`, BOT)).toBe("please review <@U2>'s PR");
+    expect(stripMention(`<@${BOT}|tandem>   hi`, BOT)).toBe("hi");
+  });
+
+  it("titles from the first line, cut at a word boundary, with a fallback", () => {
+    expect(extractTaskTitle("Fix the login page\nIt 500s on submit")).toBe("Fix the login page");
+    expect(extractTaskTitle("")).toBe("Request from Slack");
+    const long = extractTaskTitle(`${"word ".repeat(40)}end`);
+    expect(long.length).toBeLessThanOrEqual(121);
+    expect(long.endsWith("…")).toBe(true);
+  });
+
+  it("converts the markdown agents write into mrkdwn", () => {
+    expect(markdownToMrkdwn("## Plan\n\n**bold** and [docs](https://x.y/z)\n- one\n- two")).toBe(
+      "*Plan*\n\n*bold* and <https://x.y/z|docs>\n• one\n• two",
+    );
+  });
+
+  it("chunks long text at paragraph boundaries", () => {
+    const para = "a".repeat(2000);
+    const chunks = chunkText(`${para}\n\n${para}\n\n${para}`, 4100);
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0]).toBe(`${para}\n\n${para}`);
+    expect(chunks[1]).toBe(para);
+  });
+});
+
+describe("inbound: mention creates a task bound to the thread", () => {
+  let env: ReturnType<typeof makeDeps>;
+  beforeEach(() => {
+    env = makeDeps();
+  });
+
+  it("creates a task, replies in the thread, reacts, stores both bindings", async () => {
+    const outcome = await handleInboundMessage(env.deps, {
+      type: "message",
+      channel: "C1",
+      channel_type: "channel",
+      user: "U1",
+      text: `<@${BOT}> Write the release notes\nfor 2.3`,
+      ts: "100.1",
+    });
+    expect(outcome).toEqual({ kind: "created", issueId: "issue-1" });
+    expect(env.created[0]).toMatchObject({ title: "Write the release notes", projectId: "proj-1" });
+    expect(env.created[0]!.description).toContain("Write the release notes\nfor 2.3");
+    expect(env.created[0]!.description).toContain("<@U1>");
+    expect(env.posts[0]).toMatchObject({ channel: "C1", threadTs: "100.1" });
+    expect(env.posts[0]!.text).toContain("ACME-1");
+    expect(env.posts[0]!.text).toContain("https://pc.example/issues/issue-1");
+    expect(env.reactions[0]).toEqual({ channel: "C1", ts: "100.1", name: "eyes" });
+    expect(env.store.get(CHAT_STATE_KEYS.thread("C1", "100.1"))).toBe("issue-1");
+    expect(env.store.get(CHAT_STATE_KEYS.issue("issue-1"))).toEqual({ channel: "C1", threadTs: "100.1" });
+  });
+
+  it("dedupes the app_mention twin and Slack retries by channel:ts", async () => {
+    const event = { type: "message", channel: "C1", user: "U1", text: `<@${BOT}> hi`, ts: "100.1" };
+    await handleInboundMessage(env.deps, event);
+    expect(await handleInboundMessage(env.deps, { ...event, type: "app_mention" })).toEqual({ kind: "duplicate" });
+    expect(await handleInboundMessage(env.deps, event)).toEqual({ kind: "duplicate" });
+    expect(env.created).toHaveLength(1);
+  });
+
+  it("ignores plain channel messages when a mention is required, but takes DMs", async () => {
+    expect(await handleInboundMessage(env.deps, { type: "message", channel: "C1", user: "U1", text: "hello", ts: "1.1" })).toEqual({
+      kind: "ignored",
+      reason: "no_mention",
+    });
+    expect(await handleInboundMessage(env.deps, { type: "message", channel: "D1", channel_type: "im", user: "U1", text: "hello", ts: "1.2" })).toEqual({
+      kind: "created",
+      issueId: "issue-1",
+    });
+  });
+
+  it("ignores the bot's own messages, bot messages and edits", async () => {
+    expect(await handleInboundMessage(env.deps, { type: "message", channel: "C1", user: BOT, text: "x", ts: "1.1" })).toMatchObject({ kind: "ignored", reason: "own_or_bot" });
+    expect(await handleInboundMessage(env.deps, { type: "message", channel: "C1", bot_id: "B1", text: "x", ts: "1.2" })).toMatchObject({ kind: "ignored" });
+    expect(await handleInboundMessage(env.deps, { type: "message", subtype: "message_changed", channel: "C1", text: "x", ts: "1.3" })).toMatchObject({ kind: "ignored" });
+  });
+
+  it("does nothing when disabled", async () => {
+    const off = makeDeps({ enabled: false });
+    expect(await handleInboundMessage(off.deps, { type: "message", channel: "C1", user: "U1", text: `<@${BOT}> x`, ts: "1" })).toMatchObject({ kind: "ignored", reason: "disabled" });
+  });
+});
+
+describe("inbound: replies in a bound thread become comments", () => {
+  it("relays the reply as a comment, remembers it as its own, and wakes the assignee", async () => {
+    const env = makeDeps();
+    await handleInboundMessage(env.deps, { type: "message", channel: "C1", user: "U1", text: `<@${BOT}> start`, ts: "100.1" });
+    const outcome = await handleInboundMessage(env.deps, { type: "message", channel: "C1", user: "U2", text: "also check staging", ts: "100.2", thread_ts: "100.1" });
+    expect(outcome).toEqual({ kind: "commented", issueId: "issue-1", commentId: "comment-1" });
+    expect(env.comments[0]).toMatchObject({ issueId: "issue-1" });
+    expect(env.comments[0]!.body).toContain("also check staging");
+    expect(env.comments[0]!.body).toContain("<@U2>");
+    expect(env.wakeups).toEqual(["issue-1"]);
+    expect(env.store.get(CHAT_STATE_KEYS.ownComments)).toEqual(["comment-1"]);
+  });
+
+  it("ignores replies in threads it does not know, unless the bot is mentioned", async () => {
+    const env = makeDeps();
+    expect(await handleInboundMessage(env.deps, { type: "message", channel: "C1", user: "U1", text: "random", ts: "5.2", thread_ts: "5.1" })).toEqual({
+      kind: "ignored",
+      reason: "unbound_thread",
+    });
+    const outcome = await handleInboundMessage(env.deps, { type: "message", channel: "C1", user: "U1", text: `<@${BOT}> take this thread`, ts: "5.3", thread_ts: "5.1" });
+    expect(outcome).toEqual({ kind: "created", issueId: "issue-1" });
+    // Bound to the thread root, acked on the mention itself.
+    expect(env.store.get(CHAT_STATE_KEYS.thread("C1", "5.1"))).toBe("issue-1");
+    expect(env.reactions[0]).toMatchObject({ ts: "5.3" });
+  });
+});
+
+describe("outbound: task comments and status land in the thread", () => {
+  it("posts a comment it did not write, converted and chunked", async () => {
+    const env = makeDeps();
+    await handleInboundMessage(env.deps, { type: "message", channel: "C1", user: "U1", text: `<@${BOT}> start`, ts: "100.1" });
+    env.issueComments.set("issue-1", [{ id: "agent-1", body: "**Done.** See [PR](https://g.h/p/1)\n\n" + "x".repeat(5000), authorType: "agent" }]);
+    const result = await handleIssueCommentCreated(env.deps, { issueId: "issue-1", commentId: "agent-1" });
+    expect(result).toEqual({ posted: true });
+    const threadPosts = env.posts.filter((p) => p.threadTs === "100.1");
+    // 1 creation reply + 2 chunks
+    expect(threadPosts).toHaveLength(3);
+    expect(threadPosts[1]!.text.startsWith("*Done.* See <https://g.h/p/1|PR>")).toBe(true);
+  });
+
+  it("does not echo its own comments and skips unbound issues", async () => {
+    const env = makeDeps();
+    await handleInboundMessage(env.deps, { type: "message", channel: "C1", user: "U1", text: `<@${BOT}> start`, ts: "100.1" });
+    await handleInboundMessage(env.deps, { type: "message", channel: "C1", user: "U1", text: "reply", ts: "100.2", thread_ts: "100.1" });
+    expect(await handleIssueCommentCreated(env.deps, { issueId: "issue-1", commentId: "comment-1" })).toEqual({ posted: false, reason: "own" });
+    expect(await handleIssueCommentCreated(env.deps, { issueId: "issue-9", commentId: "c" })).toEqual({ posted: false, reason: "unbound" });
+  });
+
+  it("announces done in the thread", async () => {
+    const env = makeDeps();
+    await handleInboundMessage(env.deps, { type: "message", channel: "C1", user: "U1", text: `<@${BOT}> start`, ts: "100.1" });
+    expect(await handleIssueStatusChanged(env.deps, { issueId: "issue-1", status: "done", title: "start" })).toBe(true);
+    expect(env.posts.at(-1)).toMatchObject({ threadTs: "100.1", text: "✅ Task done: start" });
+    expect(await handleIssueStatusChanged(env.deps, { issueId: "issue-1", status: "in_progress" })).toBe(false);
+  });
+});
