@@ -58,6 +58,7 @@ import {
   checkWatches,
   BUILTIN_WATCH_TEMPLATES,
 } from "./proactive-suggestions.js";
+import { readSetupConfig } from "./setup-config.js";
 import { resolveStartupSlackToken, type SlackRuntimeHealth } from "./runtime-token.js";
 
 let pluginCtx: PluginContext;
@@ -455,10 +456,10 @@ const plugin = definePlugin({
   async setup(ctx) {
     // Config is per company on the host; outside a company-scoped call the
     // host cannot derive one, so the plugin names the company it serves.
-    // There is one per instance in the deployments this fork targets.
-    const setupCompanyId = await chatCompanyId(ctx);
-    const rawConfig = await ctx.config.get(setupCompanyId);
-    const config = rawConfig as unknown as SlackConfig;
+    // There is one per instance in the deployments this fork targets. A
+    // workspace nobody has connected Slack on has no config for it yet: the
+    // plugin then starts unconfigured rather than failing (setup-config.ts).
+    const { companyId: setupCompanyId, config } = await readSetupConfig<SlackConfig>(ctx);
     // Always reads the current persisted config so flag changes (e.g.
     // toggling notifyOnAgentConnected) take effect without restarting the
     // plugin worker.
