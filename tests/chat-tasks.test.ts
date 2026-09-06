@@ -5,6 +5,12 @@ import {
   extractTaskTitle,
   handleInboundMessage,
   handleIssueCommentCreated,
+  ensureTaskThread,
+  refreshTaskCard,
+  wantsTaskThread,
+  taskCardText,
+  DM_UNSUPPORTED_REPLY,
+  type ChatIssueSummary,
   handleIssueStatusChanged,
   handleRunLifecycle,
   handleInteractionAction,
@@ -40,6 +46,8 @@ function makeDeps(overrides: Partial<ChatTasksDeps["config"]> = {}) {
   let issueSeq = 0;
   let commentSeq = 0;
   const issueComments = new Map<string, Array<{ id: string; body: string; authorType: string }>>();
+  const issuesById = new Map<string, ChatIssueSummary>();
+  const agents = new Map<string, string>([["agent-ceo", "CEO"]]);
   const deps: ChatTasksDeps = {
     state: {
       get: async (k) => store.get(k),
@@ -49,8 +57,12 @@ function makeDeps(overrides: Partial<ChatTasksDeps["config"]> = {}) {
       create: async (input) => {
         created.push(input);
         issueSeq += 1;
-        return { id: `issue-${issueSeq}`, identifier: `ACME-${issueSeq}` };
+        const id = `issue-${issueSeq}`;
+        issuesById.set(id, { id, identifier: `ACME-${issueSeq}`, title: input.title, status: "todo", parentId: null, assigneeAgentId: null });
+        return { id, identifier: `ACME-${issueSeq}` };
       },
+      get: async (issueId) => issuesById.get(issueId) ?? null,
+      agentName: async (agentId) => agents.get(agentId) ?? null,
       createComment: async (issueId, body, options) => {
         if (options?.actorUserId === "user-gone") throw new Error("not an active member");
         comments.push({ issueId, body, actorUserId: options?.actorUserId });
@@ -98,6 +110,7 @@ function makeDeps(overrides: Partial<ChatTasksDeps["config"]> = {}) {
       ackReaction: "eyes",
       workingReaction: "gear",
       pairings: {},
+      tasksThreadScope: "assigned",
       issueUrl: (id) => `https://pc.example/issues/${id}`,
       ...overrides,
     },
@@ -106,7 +119,7 @@ function makeDeps(overrides: Partial<ChatTasksDeps["config"]> = {}) {
   };
   return {
     deps, store, created, comments, wakeups, posts, reactions, removed, statuses, issueComments,
-    blockPosts, updates, interactions, responses,
+    blockPosts, updates, interactions, responses, issuesById,
     setStatusSupported: (v: boolean) => { statusSupported = v; },
   };
 }
@@ -175,15 +188,20 @@ describe("inbound: mention creates a task bound to the thread", () => {
     expect(env.created).toHaveLength(1);
   });
 
-  it("ignores plain channel messages when a mention is required, but takes DMs", async () => {
+  it("answers a direct message that it is not supported yet, and creates nothing", async () => {
+    const env = makeDeps();
+    const out = await handleInboundMessage(env.deps, { type: "message", channel: "D1", channel_type: "im", user: "U1", text: "hello", ts: "1.2" });
+    expect(out).toEqual({ kind: "unsupported", reason: "dm" });
+    expect(env.created).toHaveLength(0);
+    expect(env.posts).toEqual([{ channel: "D1", text: DM_UNSUPPORTED_REPLY, threadTs: undefined }]);
+  });
+
+  it("ignores plain channel messages when a mention is required, and answers DMs with unsupported", async () => {
     expect(await handleInboundMessage(env.deps, { type: "message", channel: "C1", user: "U1", text: "hello", ts: "1.1" })).toEqual({
       kind: "ignored",
       reason: "no_mention",
     });
-    expect(await handleInboundMessage(env.deps, { type: "message", channel: "D1", channel_type: "im", user: "U1", text: "hello", ts: "1.2" })).toEqual({
-      kind: "created",
-      issueId: "issue-1",
-    });
+    expect(await handleInboundMessage(env.deps, { type: "message", channel: "D1", channel_type: "im", user: "U1", text: "hello", ts: "1.2" })).toEqual({ kind: "unsupported", reason: "dm" });
   });
 
   it("ignores the bot's own messages, bot messages and edits", async () => {
@@ -414,5 +432,65 @@ describe("inbound: paired senders are themselves", () => {
     expect(outcome.kind).toBe("commented");
     expect(env.comments.at(-1)!.actorUserId).toBeUndefined();
     expect(env.wakeups).toEqual(["issue-1"]);
+  });
+});
+
+describe("tasks channel: one thread per task", () => {
+  it("opens a thread with a card for a top-level task that has an agent, once", async () => {
+    const env = makeDeps({ tasksChannelId: "CTASKS" });
+    env.issuesById.set("t1", { id: "t1", identifier: "ACME-7", title: "Check August payments", status: "todo", priority: "high", parentId: null, assigneeAgentId: "agent-ceo" });
+    expect(await ensureTaskThread(env.deps, "t1")).toEqual({ created: true });
+    expect(env.blockPosts).toHaveLength(1);
+    expect(env.blockPosts[0].channel).toBe("CTASKS");
+    expect(env.blockPosts[0].threadTs).toBeUndefined();
+    expect(env.blockPosts[0].text).toBe(taskCardText(env.issuesById.get("t1")!, "CEO", "https://pc.example/issues/t1"));
+    expect(env.blockPosts[0].text).toContain("ACME-7: Check August payments — Queued · CEO");
+    // The card's thread is the task's thread: a reply there is a comment,
+    // an agent's comment lands there, and it is not opened twice.
+    expect(await ensureTaskThread(env.deps, "t1")).toEqual({ created: false, reason: "bound" });
+    const reply = await handleInboundMessage(env.deps, { type: "message", channel: "CTASKS", user: "U1", text: "use the July report", ts: "9.1", thread_ts: "card-1" });
+    expect(reply.kind).toBe("commented");
+    expect(env.comments[0]).toMatchObject({ issueId: "t1" });
+    expect(env.wakeups).toEqual(["t1"]);
+    env.issueComments.set("t1", [{ id: "c-agent", body: "On it.", authorType: "agent" }]);
+    expect(await handleIssueCommentCreated(env.deps, { issueId: "t1", commentId: "c-agent" })).toEqual({ posted: true });
+    expect(env.posts.at(-1)).toEqual({ channel: "CTASKS", text: "On it.", threadTs: "card-1" });
+  });
+
+  it("skips subtasks, unassigned tasks under the default scope, and everything without a channel", async () => {
+    const env = makeDeps({ tasksChannelId: "CTASKS" });
+    env.issuesById.set("sub", { id: "sub", identifier: "ACME-8", title: "Part", status: "todo", parentId: "t1", assigneeAgentId: "agent-ceo" });
+    env.issuesById.set("free", { id: "free", identifier: "ACME-9", title: "Nobody's", status: "todo", parentId: null, assigneeAgentId: null });
+    expect(await ensureTaskThread(env.deps, "sub")).toEqual({ created: false, reason: "out_of_scope" });
+    expect(await ensureTaskThread(env.deps, "free")).toEqual({ created: false, reason: "out_of_scope" });
+    // Assigned later: the next look opens it.
+    env.issuesById.get("free")!.assigneeAgentId = "agent-ceo";
+    expect(await ensureTaskThread(env.deps, "free")).toEqual({ created: true });
+    // Scope "all" takes unassigned top-level tasks too, never subtasks.
+    const all = makeDeps({ tasksChannelId: "CTASKS", tasksThreadScope: "all" });
+    expect(wantsTaskThread(all.deps.config, { id: "x", identifier: null, title: "x", status: "todo", parentId: null, assigneeAgentId: null })).toBe(true);
+    expect(wantsTaskThread(all.deps.config, { id: "x", identifier: null, title: "x", status: "todo", parentId: "p", assigneeAgentId: null })).toBe(false);
+    const off = makeDeps();
+    off.issuesById.set("t", { id: "t", identifier: null, title: "t", status: "todo", parentId: null, assigneeAgentId: "agent-ceo" });
+    expect(await ensureTaskThread(off.deps, "t")).toEqual({ created: false, reason: "no_tasks_channel" });
+    expect(env.blockPosts).toHaveLength(1);
+  });
+
+  it("edits the card in place as the task moves, and says done in the thread", async () => {
+    const env = makeDeps({ tasksChannelId: "CTASKS" });
+    env.issuesById.set("t1", { id: "t1", identifier: "ACME-7", title: "Check payments", status: "todo", parentId: null, assigneeAgentId: "agent-ceo" });
+    await ensureTaskThread(env.deps, "t1");
+    env.issuesById.get("t1")!.status = "in_progress";
+    expect(await refreshTaskCard(env.deps, "t1")).toBe(true);
+    expect(env.updates.at(-1)).toMatchObject({ channel: "CTASKS", ts: "card-1" });
+    expect(env.updates.at(-1)!.text).toContain("Working · CEO");
+    env.issuesById.get("t1")!.status = "done";
+    expect(await handleIssueStatusChanged(env.deps, { issueId: "t1", status: "done", title: "Check payments" })).toBe(true);
+    expect(env.updates.at(-1)!.text).toContain("Done · CEO");
+    expect(env.posts.at(-1)).toEqual({ channel: "CTASKS", text: "✅ Task done: Check payments", threadTs: "card-1" });
+    // A thread that began with a mention has no card to refresh.
+    const mention = makeDeps();
+    await handleInboundMessage(mention.deps, { type: "app_mention", channel: "C1", user: "U1", text: `<@${BOT}> fix it`, ts: "1.1" });
+    expect(await refreshTaskCard(mention.deps, "issue-1")).toBe(false);
   });
 });

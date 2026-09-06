@@ -25,6 +25,8 @@ export type SlackConfig = {
   chatAckReaction: string;
   chatWorkingReaction: string;
   chatPairings?: Record<string, string>;
+  chatTasksChannelId?: string;
+  chatTasksThreadScope?: "assigned" | "all";
 };
 
 // --- Session registry types ---
