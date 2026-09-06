@@ -29,7 +29,8 @@ Mention the bot in a channel it is a member of, or DM it, and the plugin creates
 - every reply in that thread becomes a comment on the task and wakes the assigned agent;
 - every comment on the task written by an agent or in the web app is posted into the thread (Markdown converted to Slack formatting, long comments split);
 - while an agent works on the task the thread shows Slack's native status ("is working on this task…", `assistant.threads.setStatus`, scope `assistant:write`); where the workspace cannot show one, a ⚙️ reaction on the task's message stands in (`chatWorkingReaction`); nothing is posted for progress;
-- a failed run gets one ❌ line; when the task is done the thread gets a ✅ line.
+- a failed run gets one ❌ line; when the task is done the thread gets a ✅ line;
+- an agent's question (`request_confirmation`, `request_checkbox_confirmation`, `ask_user_questions`, `suggest_tasks`) is a card in the thread: confirmations carry Accept/Reject buttons that answer it; questions and task suggestions show what is asked with an "Answer in Tandem" link, since the plugin SDK can accept or reject an interaction but not answer questions. Cards are posted by a 20-second poll over bound tasks (the host raises no event for interactions) and updated when the interaction settles elsewhere.
 
 A mention inside a thread the plugin does not know yet binds that thread to a new task. Plain channel messages are ignored unless `chatRequireMention` is off. Slack's `message` + `app_mention` twins and retries are deduplicated by channel and timestamp.
 
