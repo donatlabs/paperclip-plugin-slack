@@ -1,0 +1,51 @@
+{
+  "display_information": {
+    "name": "Tandem",
+    "description": "Talk to your Tandem agents from Slack: mention the bot to start a task, reply in the thread to continue it.",
+    "background_color": "#1f2937"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "Tandem",
+      "always_online": true
+    }
+  },
+  "oauth_config": {
+    "redirect_urls": ["https://REPLACE_WITH_YOUR_HOST/chat/slack/oauth/callback"],
+    "scopes": {
+      "bot": [
+        "app_mentions:read",
+        "channels:history",
+        "groups:history",
+        "im:history",
+        "mpim:history",
+        "chat:write",
+        "chat:write.customize",
+        "reactions:read",
+        "reactions:write",
+        "users:read",
+        "files:read"
+      ]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "request_url": "https://REPLACE_WITH_YOUR_HOST/chat/slack/events",
+      "bot_events": [
+        "app_mention",
+        "message.channels",
+        "message.groups",
+        "message.im",
+        "message.mpim",
+        "file_shared"
+      ]
+    },
+    "interactivity": {
+      "is_enabled": true,
+      "request_url": "https://REPLACE_WITH_YOUR_HOST/chat/slack/interactive"
+    },
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": false,
+    "token_rotation_enabled": false
+  }
+}

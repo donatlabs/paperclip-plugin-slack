@@ -21,6 +21,9 @@ const manifest: PaperclipPluginManifestV1 = {
     "companies.read",
     "issues.read",
     "issues.create",
+    "issues.wakeup",
+    "issue.comments.read",
+    "issue.comments.create",
     "agents.read",
     "agent.sessions.create",
     "agent.sessions.send",
@@ -149,6 +152,36 @@ const manifest: PaperclipPluginManifestV1 = {
         description: "Message sent to the customer while waiting for a human to respond.",
         default: DEFAULT_CONFIG.escalationHoldMessage,
       },
+      slackApiBaseUrl: {
+        type: "string",
+        title: "Slack API base URL",
+        description: "Where Web API calls go. Leave the default for a direct Slack app; a hosted Tandem workspace sets this to its proxy.",
+        default: DEFAULT_CONFIG.slackApiBaseUrl,
+      },
+      chatTasksEnabled: {
+        type: "boolean",
+        title: "Chat tasks",
+        description: "Mentioning the bot (or a DM) creates a task; the thread under it is the task's conversation.",
+        default: DEFAULT_CONFIG.chatTasksEnabled,
+      },
+      chatTasksProjectId: {
+        type: "string",
+        title: "Project for chat tasks",
+        description: "Project id that tasks created from Slack land in. Empty means no project.",
+        default: DEFAULT_CONFIG.chatTasksProjectId,
+      },
+      chatRequireMention: {
+        type: "boolean",
+        title: "Require a mention",
+        description: "When off, every top-level message in a channel the bot is in becomes a task. Keep on for shared channels.",
+        default: DEFAULT_CONFIG.chatRequireMention,
+      },
+      chatAckReaction: {
+        type: "string",
+        title: "Ack reaction",
+        description: "Emoji name added to a message that became a task. Empty disables it.",
+        default: DEFAULT_CONFIG.chatAckReaction,
+      },
       maxAgentsPerThread: {
         type: "number",
         title: "Max Agents Per Thread",
@@ -182,7 +215,7 @@ const manifest: PaperclipPluginManifestV1 = {
     {
       endpointKey: WEBHOOK_KEYS.slackEvents,
       displayName: "Slack Events API",
-      description: "Receives Slack Events API payloads (url_verification, event callbacks, file_shared).",
+      description: "Receives Slack Events API payloads (url_verification, message and app_mention for chat tasks, file_shared).",
     },
     {
       endpointKey: WEBHOOK_KEYS.slashCommand,

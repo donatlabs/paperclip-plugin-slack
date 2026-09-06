@@ -21,6 +21,23 @@ Multiple Paperclip users asked for notifications on the same day the plugin syst
 
 This is that plugin.
 
+
+## Chat tasks: one task = one thread
+
+Mention the bot in a channel it is a member of, or DM it, and the plugin creates a Paperclip task from the message: the first line is the title, the whole message is the description. The bot answers in the thread under your message with a link to the task and reacts with 👀. From then on:
+
+- every reply in that thread becomes a comment on the task and wakes the assigned agent;
+- every comment on the task written by an agent or in the web app is posted into the thread (Markdown converted to Slack formatting, long comments split);
+- when the task is done the thread gets a ✅ line.
+
+A mention inside a thread the plugin does not know yet binds that thread to a new task. Plain channel messages are ignored unless `chatRequireMention` is off. Slack's `message` + `app_mention` twins and retries are deduplicated by channel and timestamp.
+
+Config keys: `chatTasksEnabled`, `chatTasksProjectId`, `chatRequireMention`, `chatAckReaction`. Required Slack bot events: `app_mention`, `message.channels`, `message.groups`, `message.im`, `message.mpim`; scopes: `app_mentions:read`, `channels:history`, `groups:history`, `im:history`, `mpim:history`, `chat:write`, `reactions:write`. `slack-app-manifest.json` in this repository is a complete app manifest to paste into Slack.
+
+### Behind a proxy (hosted Tandem)
+
+`slackApiBaseUrl` points every Web API call somewhere other than `https://slack.com/api`. A hosted deployment sets it to a control-plane proxy that holds the real bot token; `slackTokenRef` then resolves to a bearer for that proxy, and the proxy re-signs inbound webhooks with the secret in `slackSigningSecretRef` using Slack's own `v0=` scheme. The plugin code does not change between the two modes, which is the point: the Slack credential for a customer workspace never has to enter the customer's Paperclip instance.
+
 ## What it does
 
 ### Phase 1: Notifications + HITL Escalation
