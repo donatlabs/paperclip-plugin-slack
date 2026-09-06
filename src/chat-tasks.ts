@@ -26,6 +26,9 @@ export interface ChatIssuesClient {
 export interface ChatSlackClient {
   postMessage(channel: string, text: string, threadTs?: string): Promise<{ ok: boolean; ts?: string; error?: string }>;
   addReaction(channel: string, ts: string, name: string): Promise<void>;
+  removeReaction(channel: string, ts: string, name: string): Promise<void>;
+  /** Slack's native thread status; resolves false when the workspace or token cannot show one. */
+  setThreadStatus(channel: string, threadTs: string, status: string): Promise<boolean>;
 }
 
 export interface ChatTasksConfig {
@@ -34,6 +37,8 @@ export interface ChatTasksConfig {
   requireMention: boolean;
   projectId?: string;
   ackReaction: string;
+  /** Reaction that stands in for the thread status where Slack cannot show one. */
+  workingReaction: string;
   issueUrl(issueId: string): string;
 }
 
@@ -71,7 +76,12 @@ export const CHAT_STATE_KEYS = {
   dedupe: "chat-dedupe",
   /** rolling list of comment ids this plugin wrote, so they are not echoed back */
   ownComments: "chat-own-comments",
+  /** issue id -> the run currently shown as working, so a stale finish cannot clear a newer start */
+  working: (issueId: string) => `chat-working-${issueId}`,
 } as const;
+
+/** What the thread status says while an agent is on the task. */
+export const WORKING_STATUS = "is working on this task…";
 
 const DEDUPE_WINDOW = 500;
 const OWN_COMMENTS_WINDOW = 500;
@@ -290,7 +300,11 @@ export async function handleIssueCommentCreated(
   return { posted: true };
 }
 
-/** Handles a status change on a bound task: a short line in the thread. */
+/**
+ * Handles a status change on a bound task. A finished task gets one line in
+ * the thread and the working marks come off; in-progress and anything else
+ * are shown by the run lifecycle, not by a message.
+ */
 export async function handleIssueStatusChanged(
   deps: ChatTasksDeps,
   input: { issueId: string; status: string; title?: string },
@@ -304,6 +318,59 @@ export async function handleIssueStatusChanged(
         ? `🚫 Task cancelled${input.title ? `: ${input.title}` : ""}`
         : null;
   if (!line) return false;
+  await clearWorking(deps, input.issueId, binding);
   const result = await deps.slack.postMessage(binding.channel, line, binding.threadTs);
   return result.ok;
+}
+
+export type RunLifecycle = "started" | "finished" | "failed" | "cancelled";
+
+/**
+ * Handles an agent run on a bound task. While the run lasts the thread
+ * carries Slack's native status ("is working…"), or, where the workspace
+ * cannot show one, a reaction on the message that started the task; nothing
+ * is posted. A failed run is the one outcome that gets a line, because the
+ * person would otherwise wait for an answer that is not coming.
+ */
+export async function handleRunLifecycle(
+  deps: ChatTasksDeps,
+  input: { issueId: string; runId: string; state: RunLifecycle; error?: string },
+): Promise<boolean> {
+  if (!deps.config.enabled) return false;
+  const binding = await getIssueThread(deps.state, input.issueId);
+  if (!binding) return false;
+  if (input.state === "started") {
+    await deps.state.set(CHAT_STATE_KEYS.working(input.issueId), input.runId);
+    const shown = await deps.slack.setThreadStatus(binding.channel, binding.threadTs, WORKING_STATUS);
+    if (!shown && deps.config.workingReaction) {
+      await safely(deps, () => deps.slack.addReaction(binding.channel, binding.threadTs, deps.config.workingReaction));
+    }
+    return true;
+  }
+  // A finish for a run that is not the one shown (an older run ending after
+  // a newer one started) must not clear the newer run's status.
+  const shown = await deps.state.get(CHAT_STATE_KEYS.working(input.issueId));
+  if (typeof shown === "string" && shown && shown !== input.runId) return false;
+  await clearWorking(deps, input.issueId, binding);
+  if (input.state === "failed") {
+    const reason = input.error ? `: ${input.error}` : "";
+    await deps.slack.postMessage(binding.channel, `❌ The agent's run failed${reason}`, binding.threadTs);
+  }
+  return true;
+}
+
+async function clearWorking(deps: ChatTasksDeps, issueId: string, binding: ThreadBinding): Promise<void> {
+  await deps.state.set(CHAT_STATE_KEYS.working(issueId), "");
+  await deps.slack.setThreadStatus(binding.channel, binding.threadTs, "");
+  if (deps.config.workingReaction) {
+    await safely(deps, () => deps.slack.removeReaction(binding.channel, binding.threadTs, deps.config.workingReaction));
+  }
+}
+
+async function safely(deps: ChatTasksDeps, fn: () => Promise<void>): Promise<void> {
+  try {
+    await fn();
+  } catch (err) {
+    deps.log.warn("Slack call failed", { err: String(err) });
+  }
 }

@@ -1,5 +1,5 @@
 export const PLUGIN_ID = "paperclip-plugin-slack";
-export const PLUGIN_VERSION = "2.1.1";
+export const PLUGIN_VERSION = "2.2.0";
 
 export const WEBHOOK_KEYS = {
   slackEvents: "slack-events",
@@ -63,4 +63,7 @@ export const DEFAULT_CONFIG = {
   chatTasksProjectId: "",
   chatRequireMention: true,
   chatAckReaction: "eyes",
+  // Shown on the message that started a task while an agent works on it, in
+  // workspaces where Slack's native thread status is not available.
+  chatWorkingReaction: "gear",
 } as const;

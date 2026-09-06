@@ -6,7 +6,9 @@ import {
   handleInboundMessage,
   handleIssueCommentCreated,
   handleIssueStatusChanged,
+  handleRunLifecycle,
   markdownToMrkdwn,
+  WORKING_STATUS,
   stripMention,
   type ChatTasksDeps,
 } from "../src/chat-tasks.js";
@@ -20,6 +22,9 @@ function makeDeps(overrides: Partial<ChatTasksDeps["config"]> = {}) {
   const wakeups: string[] = [];
   const posts: Array<{ channel: string; text: string; threadTs?: string }> = [];
   const reactions: Array<{ channel: string; ts: string; name: string }> = [];
+  const removed: Array<{ channel: string; ts: string; name: string }> = [];
+  const statuses: Array<{ channel: string; threadTs: string; status: string }> = [];
+  let statusSupported = true;
   let issueSeq = 0;
   let commentSeq = 0;
   const issueComments = new Map<string, Array<{ id: string; body: string; authorType: string }>>();
@@ -52,19 +57,28 @@ function makeDeps(overrides: Partial<ChatTasksDeps["config"]> = {}) {
         return { ok: true, ts: `${posts.length}.000` };
       },
       addReaction: async (channel, ts, name) => void reactions.push({ channel, ts, name }),
+      removeReaction: async (channel, ts, name) => void removed.push({ channel, ts, name }),
+      setThreadStatus: async (channel, threadTs, status) => {
+        statuses.push({ channel, threadTs, status });
+        return statusSupported;
+      },
     },
     config: {
       enabled: true,
       requireMention: true,
       projectId: "proj-1",
       ackReaction: "eyes",
+      workingReaction: "gear",
       issueUrl: (id) => `https://pc.example/issues/${id}`,
       ...overrides,
     },
     botUserId: BOT,
     log: { info() {}, warn() {} },
   };
-  return { deps, store, created, comments, wakeups, posts, reactions, issueComments };
+  return {
+    deps, store, created, comments, wakeups, posts, reactions, removed, statuses, issueComments,
+    setStatusSupported: (v: boolean) => { statusSupported = v; },
+  };
 }
 
 describe("text helpers", () => {
@@ -208,5 +222,58 @@ describe("outbound: task comments and status land in the thread", () => {
     expect(await handleIssueStatusChanged(env.deps, { issueId: "issue-1", status: "done", title: "start" })).toBe(true);
     expect(env.posts.at(-1)).toMatchObject({ threadTs: "100.1", text: "✅ Task done: start" });
     expect(await handleIssueStatusChanged(env.deps, { issueId: "issue-1", status: "in_progress" })).toBe(false);
+  });
+});
+
+describe("run lifecycle: the thread's status, not a message", () => {
+  async function bound() {
+    const env = makeDeps();
+    await handleInboundMessage(env.deps, { type: "message", channel: "C1", user: "U1", text: `<@${BOT}> start`, ts: "100.1" });
+    const postsBefore = env.posts.length;
+    return { env, postsBefore };
+  }
+
+  it("shows Slack's native status while the run lasts and clears it after, posting nothing", async () => {
+    const { env, postsBefore } = await bound();
+    expect(await handleRunLifecycle(env.deps, { issueId: "issue-1", runId: "run-1", state: "started" })).toBe(true);
+    expect(env.statuses).toEqual([{ channel: "C1", threadTs: "100.1", status: WORKING_STATUS }]);
+    expect(env.reactions.filter((r) => r.name === "gear")).toHaveLength(0);
+    expect(await handleRunLifecycle(env.deps, { issueId: "issue-1", runId: "run-1", state: "finished" })).toBe(true);
+    expect(env.statuses.at(-1)).toEqual({ channel: "C1", threadTs: "100.1", status: "" });
+    expect(env.posts).toHaveLength(postsBefore);
+  });
+
+  it("falls back to a reaction where the workspace cannot show a status", async () => {
+    const { env } = await bound();
+    env.setStatusSupported(false);
+    await handleRunLifecycle(env.deps, { issueId: "issue-1", runId: "run-1", state: "started" });
+    expect(env.reactions.at(-1)).toEqual({ channel: "C1", ts: "100.1", name: "gear" });
+    await handleRunLifecycle(env.deps, { issueId: "issue-1", runId: "run-1", state: "finished" });
+    expect(env.removed.at(-1)).toEqual({ channel: "C1", ts: "100.1", name: "gear" });
+  });
+
+  it("posts one line when the run fails", async () => {
+    const { env, postsBefore } = await bound();
+    await handleRunLifecycle(env.deps, { issueId: "issue-1", runId: "run-1", state: "started" });
+    await handleRunLifecycle(env.deps, { issueId: "issue-1", runId: "run-1", state: "failed", error: "timed out" });
+    expect(env.posts).toHaveLength(postsBefore + 1);
+    expect(env.posts.at(-1)).toMatchObject({ threadTs: "100.1", text: "❌ The agent's run failed: timed out" });
+  });
+
+  it("ignores an older run finishing after a newer one started, and unbound issues", async () => {
+    const { env } = await bound();
+    await handleRunLifecycle(env.deps, { issueId: "issue-1", runId: "run-1", state: "started" });
+    await handleRunLifecycle(env.deps, { issueId: "issue-1", runId: "run-2", state: "started" });
+    expect(await handleRunLifecycle(env.deps, { issueId: "issue-1", runId: "run-1", state: "finished" })).toBe(false);
+    expect(env.statuses.at(-1)!.status).toBe(WORKING_STATUS);
+    expect(await handleRunLifecycle(env.deps, { issueId: "issue-9", runId: "r", state: "started" })).toBe(false);
+  });
+
+  it("clears the working marks when the task is done", async () => {
+    const { env } = await bound();
+    await handleRunLifecycle(env.deps, { issueId: "issue-1", runId: "run-1", state: "started" });
+    await handleIssueStatusChanged(env.deps, { issueId: "issue-1", status: "done" });
+    expect(env.statuses.at(-1)!.status).toBe("");
+    expect(env.posts.at(-1)!.text).toContain("✅");
   });
 });

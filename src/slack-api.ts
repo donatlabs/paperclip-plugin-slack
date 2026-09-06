@@ -233,3 +233,49 @@ export async function authTest(
   });
   return await response.json() as { ok: boolean; user_id?: string; team_id?: string; user?: string; error?: string };
 }
+
+export async function removeReaction(
+  ctx: PluginContext,
+  token: string,
+  channelId: string,
+  ts: string,
+  name: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const response = await fetchWithRetry(ctx, `${slackApiBase}/reactions.remove`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ channel: channelId, timestamp: ts, name }),
+  });
+  const body = await response.json() as { ok: boolean; error?: string };
+  if (!body.ok && body.error !== "no_reaction") {
+    ctx.logger.warn("Slack reactions.remove failed", { error: body.error, channelId, ts });
+  }
+  return body;
+}
+
+/**
+ * Sets the native status under a thread ("is working…"); an empty status
+ * clears it. Needs the assistant:write scope and the app's Agents & AI Apps
+ * feature; a token without them answers missing_scope or not_allowed, which
+ * the caller treats as "not available" rather than a failure.
+ */
+export async function setThreadStatus(
+  ctx: PluginContext,
+  token: string,
+  channelId: string,
+  threadTs: string,
+  status: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const response = await fetchWithRetry(ctx, `${slackApiBase}/assistant.threads.setStatus`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ channel_id: channelId, thread_ts: threadTs, status }),
+  });
+  return await response.json() as { ok: boolean; error?: string };
+}
