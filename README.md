@@ -34,7 +34,7 @@ Mention the bot in a channel it is a member of, or DM it, and the plugin creates
 
 A mention inside a thread the plugin does not know yet binds that thread to a new task. Plain channel messages are ignored unless `chatRequireMention` is off. Slack's `message` + `app_mention` twins and retries are deduplicated by channel and timestamp.
 
-Config keys: `chatTasksEnabled`, `chatTasksProjectId`, `chatRequireMention`, `chatAckReaction`. Required Slack bot events: `app_mention`, `message.channels`, `message.groups`, `message.im`, `message.mpim`; scopes: `app_mentions:read`, `channels:history`, `groups:history`, `im:history`, `mpim:history`, `chat:write`, `reactions:write`. `slack-app-manifest.json` in this repository is a complete app manifest to paste into Slack.
+Config keys: `chatTasksEnabled`, `chatTasksProjectId`, `chatRequireMention`, `chatAckReaction`, `chatWorkingReaction`, `chatPairings` (Slack user id → Tandem user id: a paired person's replies are their own comments and wake the assignee the way a web comment does; everyone else is relayed under the bot's name). Required Slack bot events: `app_mention`, `message.channels`, `message.groups`, `message.im`, `message.mpim`; scopes: `app_mentions:read`, `channels:history`, `groups:history`, `im:history`, `mpim:history`, `chat:write`, `reactions:write`. `slack-app-manifest.json` in this repository is a complete app manifest to paste into Slack.
 
 ### Behind a proxy (hosted Tandem)
 

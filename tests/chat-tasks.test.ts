@@ -26,7 +26,7 @@ const BOT = "UBOT";
 function makeDeps(overrides: Partial<ChatTasksDeps["config"]> = {}) {
   const store = new Map<string, unknown>();
   const created: Array<{ title: string; description: string; projectId?: string }> = [];
-  const comments: Array<{ issueId: string; body: string }> = [];
+  const comments: Array<{ issueId: string; body: string; actorUserId?: string }> = [];
   const wakeups: string[] = [];
   const posts: Array<{ channel: string; text: string; threadTs?: string }> = [];
   const reactions: Array<{ channel: string; ts: string; name: string }> = [];
@@ -51,8 +51,9 @@ function makeDeps(overrides: Partial<ChatTasksDeps["config"]> = {}) {
         issueSeq += 1;
         return { id: `issue-${issueSeq}`, identifier: `ACME-${issueSeq}` };
       },
-      createComment: async (issueId, body) => {
-        comments.push({ issueId, body });
+      createComment: async (issueId, body, options) => {
+        if (options?.actorUserId === "user-gone") throw new Error("not an active member");
+        comments.push({ issueId, body, actorUserId: options?.actorUserId });
         commentSeq += 1;
         const id = `comment-${commentSeq}`;
         const list = issueComments.get(issueId) ?? [];
@@ -96,6 +97,7 @@ function makeDeps(overrides: Partial<ChatTasksDeps["config"]> = {}) {
       projectId: "proj-1",
       ackReaction: "eyes",
       workingReaction: "gear",
+      pairings: {},
       issueUrl: (id) => `https://pc.example/issues/${id}`,
       ...overrides,
     },
@@ -388,5 +390,29 @@ describe("interactions: cards in the thread", () => {
     env.interactions.set("issue-9", [{ ...confirm }]);
     expect(await syncInteractions(env.deps, "issue-9")).toBe(0);
     expect(env.blockPosts).toHaveLength(0);
+  });
+});
+
+describe("inbound: paired senders are themselves", () => {
+  it("attributes a paired person's reply to their Tandem user and lets the host wake the assignee", async () => {
+    const env = makeDeps({ pairings: { U2: "auth0|pavel" } });
+    await handleInboundMessage(env.deps, { type: "message", channel: "C1", user: "U1", text: `<@${BOT}> start`, ts: "100.1" });
+    await handleInboundMessage(env.deps, { type: "message", channel: "C1", user: "U2", text: "ship it", ts: "100.2", thread_ts: "100.1" });
+    expect(env.comments.at(-1)).toEqual({ issueId: "issue-1", body: "ship it", actorUserId: "auth0|pavel" });
+    expect(env.wakeups).toEqual([]);
+    // Unpaired people are relayed by the bot, with a wakeup.
+    await handleInboundMessage(env.deps, { type: "message", channel: "C1", user: "U3", text: "me too", ts: "100.3", thread_ts: "100.1" });
+    expect(env.comments.at(-1)!.actorUserId).toBeUndefined();
+    expect(env.comments.at(-1)!.body).toContain("<@U3>");
+    expect(env.wakeups).toEqual(["issue-1"]);
+  });
+
+  it("falls back to the bot when the host refuses the pairing", async () => {
+    const env = makeDeps({ pairings: { U2: "user-gone" } });
+    await handleInboundMessage(env.deps, { type: "message", channel: "C1", user: "U1", text: `<@${BOT}> start`, ts: "100.1" });
+    const outcome = await handleInboundMessage(env.deps, { type: "message", channel: "C1", user: "U2", text: "hello", ts: "100.2", thread_ts: "100.1" });
+    expect(outcome.kind).toBe("commented");
+    expect(env.comments.at(-1)!.actorUserId).toBeUndefined();
+    expect(env.wakeups).toEqual(["issue-1"]);
   });
 });

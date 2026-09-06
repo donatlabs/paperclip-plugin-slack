@@ -85,6 +85,16 @@ const INTERACTION_POLL_MS = 20_000;
 
 // --- Chat tasks (one task = one thread) ---
 
+/** chatPairings is a map of Slack user id to Paperclip user id, written by the control plane. */
+function readPairings(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof v === "string" && v) out[k] = v;
+  }
+  return out;
+}
+
 async function chatCompanyId(ctx: PluginContext): Promise<string | undefined> {
   const companies = await ctx.companies.list({ limit: 1, offset: 0 });
   return companies[0]?.id;
@@ -109,8 +119,8 @@ async function buildChatDeps(ctx: PluginContext, companyId: string): Promise<Cha
         });
         return { id: issue.id, identifier: issue.identifier ?? null };
       },
-      createComment: async (issueId, body) => {
-        const comment = await ctx.issues.createComment(issueId, body, companyId);
+      createComment: async (issueId, body, options) => {
+        const comment = await ctx.issues.createComment(issueId, body, companyId, options?.actorUserId ? { actorUserId: options.actorUserId } : undefined);
         return { id: comment.id };
       },
       requestWakeup: async (issueId, reason) => {
@@ -163,6 +173,7 @@ async function buildChatDeps(ctx: PluginContext, companyId: string): Promise<Cha
       projectId: config.chatTasksProjectId || undefined,
       ackReaction: config.chatAckReaction ?? "eyes",
       workingReaction: config.chatWorkingReaction ?? "gear",
+      pairings: readPairings(config.chatPairings),
       issueUrl: (issueId) => `${base}/issues/${issueId}`,
     },
     botUserId,
