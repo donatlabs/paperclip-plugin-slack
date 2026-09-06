@@ -16,8 +16,22 @@ export interface ChatStateStore {
   set(key: ChatStateKey, value: unknown): Promise<void>;
 }
 
+/** The fields of a task the tasks channel shows on its card. */
+export interface ChatIssueSummary {
+  id: string;
+  identifier: string | null;
+  title: string;
+  status: string;
+  priority?: string | null;
+  parentId: string | null;
+  assigneeAgentId: string | null;
+}
+
 export interface ChatIssuesClient {
   create(input: { title: string; description: string; projectId?: string }): Promise<{ id: string; identifier: string | null }>;
+  get(issueId: string): Promise<ChatIssueSummary | null>;
+  /** An agent's display name, or null when it is gone. */
+  agentName(agentId: string): Promise<string | null>;
   /** actorUserId attributes the comment to that Paperclip user; the host wakes the assignee for it. */
   createComment(issueId: string, body: string, options?: { actorUserId?: string }): Promise<{ id: string }>;
   requestWakeup(issueId: string, reason: string): Promise<void>;
@@ -56,6 +70,10 @@ export interface ChatTasksConfig {
   workingReaction: string;
   /** Slack user id -> Paperclip user id, for comments attributed to the person rather than the bot. */
   pairings: Record<string, string>;
+  /** Channel where every task gets its own thread; empty turns the tasks channel off. */
+  tasksChannelId?: string;
+  /** Which tasks get a thread there: those with an agent assigned, or every top-level task. */
+  tasksThreadScope: "assigned" | "all";
   issueUrl(issueId: string): string;
 }
 
@@ -99,6 +117,8 @@ export const CHAT_STATE_KEYS = {
   interaction: (id: string) => `chat-interaction-${id}`,
   /** issue ids with a thread, for the interaction poll */
   boundIssues: "chat-bound-issues",
+  /** issue id -> { channel, ts } of its card at the root of the tasks-channel thread */
+  card: (issueId: string) => `chat-card-${issueId}`,
 } as const;
 
 const BOUND_ISSUES_WINDOW = 200;
@@ -121,8 +141,13 @@ export const SLACK_CHUNK_LENGTH = 3900;
 export type InboundOutcome =
   | { kind: "created"; issueId: string }
   | { kind: "commented"; issueId: string; commentId: string }
+  | { kind: "unsupported"; reason: string }
   | { kind: "ignored"; reason: string }
   | { kind: "duplicate" };
+
+/** What the bot answers to a direct message, which it does not take yet. */
+export const DM_UNSUPPORTED_REPLY =
+  "Direct messages are not supported yet. Mention me in a channel I have been added to, or reply in a task's thread.";
 
 const IGNORED_SUBTYPES = new Set([
   "message_changed",
@@ -254,6 +279,14 @@ export async function handleInboundMessage(deps: ChatTasksDeps, event: SlackMess
   const isDm = event.channel_type === "im" || channel.startsWith("D");
   const threadRoot = event.thread_ts && event.thread_ts !== ts ? event.thread_ts : null;
 
+  // Direct messages are not a place for tasks yet: the person is told so,
+  // once per message, and nothing is created.
+  if (isDm) {
+    const reply = await deps.slack.postMessage(channel, DM_UNSUPPORTED_REPLY, threadRoot ?? undefined);
+    if (!reply.ok) deps.log.warn("DM reply failed", { channel, error: reply.error });
+    return { kind: "unsupported", reason: "dm" };
+  }
+
   if (threadRoot) {
     const issueId = await getThreadIssue(deps.state, channel, threadRoot);
     if (issueId) {
@@ -267,8 +300,8 @@ export async function handleInboundMessage(deps: ChatTasksDeps, event: SlackMess
     return createTaskForThread(deps, { channel, threadTs: threadRoot, text, user: event.user, ackTs: ts });
   }
 
-  if (!mentioned && !isDm && deps.config.requireMention) return { kind: "ignored", reason: "no_mention" };
-  if (!mentioned && !isDm && !deps.config.requireMention && !text) return { kind: "ignored", reason: "empty" };
+  if (!mentioned && deps.config.requireMention) return { kind: "ignored", reason: "no_mention" };
+  if (!mentioned && !deps.config.requireMention && !text) return { kind: "ignored", reason: "empty" };
   return createTaskForThread(deps, { channel, threadTs: ts, text, user: event.user, ackTs: ts });
 }
 
@@ -375,8 +408,12 @@ export async function handleIssueStatusChanged(
       : input.status === "cancelled"
         ? `🚫 Task cancelled${input.title ? `: ${input.title}` : ""}`
         : null;
-  if (!line) return false;
+  if (!line) {
+    await refreshTaskCard(deps, input.issueId);
+    return false;
+  }
   await clearWorking(deps, input.issueId, binding);
+  await refreshTaskCard(deps, input.issueId);
   const result = await deps.slack.postMessage(binding.channel, line, binding.threadTs);
   return result.ok;
 }
@@ -431,6 +468,124 @@ async function safely(deps: ChatTasksDeps, fn: () => Promise<void>): Promise<voi
   } catch (err) {
     deps.log.warn("Slack call failed", { err: String(err) });
   }
+}
+
+// ---- tasks channel: one thread per task --------------------------------------
+//
+// The other direction of the binding: a task that appears in Tandem gets a
+// thread in a channel the workspace chose, rooted at a card that says what
+// the task is, who has it and how it is going. Replies under the card go to
+// the task like any bound thread, the agent's comments come back, and the
+// card is edited in place as the task moves; nothing else is posted for it
+// in that channel.
+
+export type TaskCard = { channel: string; ts: string };
+
+/** What the tasks channel says about a task. */
+export function taskCardText(issue: ChatIssueSummary, assigneeName: string | null, url: string): string {
+  const label = issue.identifier ?? issue.id.slice(0, 8);
+  const who = assigneeName ?? (issue.assigneeAgentId ? "an agent" : "nobody yet");
+  return `${label}: ${issue.title} — ${statusLabel(issue.status)} · ${who} · ${url}`;
+}
+
+export function taskCardBlocks(issue: ChatIssueSummary, assigneeName: string | null, url: string): unknown[] {
+  const label = issue.identifier ?? issue.id.slice(0, 8);
+  const who = assigneeName ?? (issue.assigneeAgentId ? "an agent" : "nobody yet");
+  return [
+    {
+      type: "section",
+      text: { type: "mrkdwn", text: `*${label}* ${issue.title}`.slice(0, 2900) },
+      accessory: { type: "button", text: { type: "plain_text", text: "Open" }, url, action_id: "chat_task_open" },
+    },
+    {
+      type: "context",
+      elements: [{ type: "mrkdwn", text: `${statusLabel(issue.status)} · ${who}${issue.priority ? ` · ${issue.priority}` : ""}` }],
+    },
+  ];
+}
+
+export function statusLabel(status: string): string {
+  switch (status) {
+    case "todo":
+    case "backlog":
+      return "Queued";
+    case "in_progress":
+      return "Working";
+    case "blocked":
+      return "Needs you";
+    case "in_review":
+      return "In review";
+    case "done":
+      return "Done";
+    case "cancelled":
+      return "Cancelled";
+    default:
+      return status || "Queued";
+  }
+}
+
+export async function getTaskCard(state: ChatStateStore, issueId: string): Promise<TaskCard | null> {
+  const value = await state.get(CHAT_STATE_KEYS.card(issueId));
+  if (value && typeof value === "object" && typeof (value as TaskCard).ts === "string") return value as TaskCard;
+  return null;
+}
+
+/** Whether a task belongs in the tasks channel under the configured scope. */
+export function wantsTaskThread(config: ChatTasksConfig, issue: ChatIssueSummary): boolean {
+  if (!config.enabled || !config.tasksChannelId) return false;
+  if (issue.parentId) return false;
+  if (issue.status === "done" || issue.status === "cancelled") return false;
+  return config.tasksThreadScope === "all" || Boolean(issue.assigneeAgentId);
+}
+
+/**
+ * Gives a task its thread in the tasks channel, once. A task that already
+ * lives in a thread (one created from a mention, or one this ran for before)
+ * is left where it is; a task the scope does not cover is skipped, and
+ * looked at again on its next update, since assignment often comes later
+ * than creation.
+ */
+export async function ensureTaskThread(deps: ChatTasksDeps, issueId: string): Promise<{ created: boolean; reason?: string }> {
+  if (!deps.config.enabled || !deps.config.tasksChannelId) return { created: false, reason: "no_tasks_channel" };
+  if (await getIssueThread(deps.state, issueId)) return { created: false, reason: "bound" };
+  const issue = await deps.issues.get(issueId);
+  if (!issue) return { created: false, reason: "issue_not_found" };
+  if (!wantsTaskThread(deps.config, issue)) return { created: false, reason: "out_of_scope" };
+  // Two events for one task can land together (created, then assigned);
+  // the first to claim the key posts the card, the other sees the claim.
+  const claimKey = CHAT_STATE_KEYS.card(issueId);
+  if (await deps.state.get(claimKey)) return { created: false, reason: "claimed" };
+  await deps.state.set(claimKey, { channel: deps.config.tasksChannelId, ts: "" });
+  const assigneeName = issue.assigneeAgentId ? await deps.issues.agentName(issue.assigneeAgentId) : null;
+  const url = deps.config.issueUrl(issue.id);
+  const card = await deps.slack.postBlocks(deps.config.tasksChannelId, taskCardText(issue, assigneeName, url), taskCardBlocks(issue, assigneeName, url));
+  if (!card.ok || !card.ts) {
+    await deps.state.set(claimKey, "");
+    deps.log.warn("tasks channel card failed", { issueId, channel: deps.config.tasksChannelId, error: card.error });
+    return { created: false, reason: card.error ?? "slack_error" };
+  }
+  const binding = { channel: deps.config.tasksChannelId, threadTs: card.ts };
+  await deps.state.set(claimKey, { channel: binding.channel, ts: card.ts });
+  await bindThread(deps.state, issueId, binding);
+  deps.log.info("task thread opened", { issueId, channel: binding.channel, threadTs: card.ts });
+  return { created: true };
+}
+
+/**
+ * Brings a task's card up to date after the task changed: title, status,
+ * assignee. A task without a card (a thread started from a mention) has
+ * nothing to refresh.
+ */
+export async function refreshTaskCard(deps: ChatTasksDeps, issueId: string): Promise<boolean> {
+  const card = await getTaskCard(deps.state, issueId);
+  if (!card || !card.ts) return false;
+  const issue = await deps.issues.get(issueId);
+  if (!issue) return false;
+  const assigneeName = issue.assigneeAgentId ? await deps.issues.agentName(issue.assigneeAgentId) : null;
+  const url = deps.config.issueUrl(issue.id);
+  const result = await deps.slack.updateMessage(card.channel, card.ts, taskCardText(issue, assigneeName, url), taskCardBlocks(issue, assigneeName, url));
+  if (!result.ok) deps.log.warn("task card update failed", { issueId, error: result.error });
+  return result.ok;
 }
 
 // ---- interactions -----------------------------------------------------------

@@ -1,5 +1,5 @@
 export const PLUGIN_ID = "paperclip-plugin-slack";
-export const PLUGIN_VERSION = "2.4.1";
+export const PLUGIN_VERSION = "2.5.0";
 
 export const WEBHOOK_KEYS = {
   slackEvents: "slack-events",
@@ -66,4 +66,9 @@ export const DEFAULT_CONFIG = {
   // Shown on the message that started a task while an agent works on it, in
   // workspaces where Slack's native thread status is not available.
   chatWorkingReaction: "gear",
+  // The tasks channel: every task gets a thread there, rooted at a card.
+  // Empty means no tasks channel; tasks then live only in threads that
+  // started from a mention.
+  chatTasksChannelId: "",
+  chatTasksThreadScope: "assigned",
 } as const;

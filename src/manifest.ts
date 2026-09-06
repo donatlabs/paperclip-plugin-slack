@@ -193,6 +193,19 @@ const manifest: PaperclipPluginManifestV1 = {
         additionalProperties: { type: "string" },
         default: {},
       },
+      chatTasksChannelId: {
+        type: "string",
+        title: "Tasks channel",
+        description: "Channel id (e.g. C01ABC2DEF3) where every task gets its own thread, rooted at a card with its status and assignee. Invite the bot to it. Empty means no tasks channel.",
+        default: DEFAULT_CONFIG.chatTasksChannelId,
+      },
+      chatTasksThreadScope: {
+        type: "string",
+        enum: ["assigned", "all"],
+        title: "Which tasks get a thread",
+        description: "assigned: top-level tasks that have an agent (the default, keeps the channel readable). all: every top-level task. Subtasks never get their own thread.",
+        default: DEFAULT_CONFIG.chatTasksThreadScope,
+      },
       chatAckReaction: {
         type: "string",
         title: "Ack reaction",

@@ -21,6 +21,8 @@ import {
   type ChatTasksDeps,
   type RunLifecycle,
   type SlackMessageEvent,
+  ensureTaskThread,
+  refreshTaskCard,
 } from "./chat-tasks.js";
 import type { SlackMessage } from "./slack-api.js";
 import type { SlackConfig, EscalationRecord, CommandDefinition, SessionEntry } from "./types.js";
@@ -119,6 +121,27 @@ async function buildChatDeps(ctx: PluginContext, companyId: string): Promise<Cha
         });
         return { id: issue.id, identifier: issue.identifier ?? null };
       },
+      get: async (issueId) => {
+        const issue = await ctx.issues.get(issueId, companyId);
+        if (!issue) return null;
+        return {
+          id: issue.id,
+          identifier: issue.identifier ?? null,
+          title: issue.title,
+          status: String(issue.status),
+          priority: issue.priority ? String(issue.priority) : null,
+          parentId: issue.parentId ?? null,
+          assigneeAgentId: issue.assigneeAgentId ?? null,
+        };
+      },
+      agentName: async (agentId) => {
+        try {
+          const agent = await ctx.agents.get(agentId, companyId);
+          return agent?.name ?? null;
+        } catch {
+          return null;
+        }
+      },
       createComment: async (issueId, body, options) => {
         const comment = await ctx.issues.createComment(issueId, body, companyId, options?.actorUserId ? { actorUserId: options.actorUserId } : undefined);
         return { id: comment.id };
@@ -174,6 +197,8 @@ async function buildChatDeps(ctx: PluginContext, companyId: string): Promise<Cha
       ackReaction: config.chatAckReaction ?? "eyes",
       workingReaction: config.chatWorkingReaction ?? "gear",
       pairings: readPairings(config.chatPairings),
+      tasksChannelId: config.chatTasksChannelId || undefined,
+      tasksThreadScope: config.chatTasksThreadScope === "all" ? "all" : "assigned",
       issueUrl: (issueId) => `${base}/issues/${issueId}`,
     },
     botUserId,
@@ -948,6 +973,12 @@ const plugin = definePlugin({
     // Handlers are always registered so that config changes (e.g. toggling
     // notifyOnAgentConnected) take effect without a plugin restart.
     ctx.events.on("issue.created", async (event: PluginEvent) => {
+      // A task the tasks channel takes has its card there; that is its
+      // announcement, and the notification would only repeat it.
+      if (event.entityId) {
+        const opened = await ensureTaskThread(await buildChatDeps(ctx, event.companyId), event.entityId);
+        if (opened.created) return;
+      }
       const live = await getConfig();
       if (!live.notifyOnIssueCreated) return;
       const result = await notify(event, formatIssueCreated);
@@ -961,14 +992,21 @@ const plugin = definePlugin({
 
     ctx.events.on("issue.updated", async (event: PluginEvent) => {
       const payload = event.payload as Record<string, unknown>;
-      if (payload.status !== "done") return;
+      // A task assigned after it was created qualifies for the tasks
+      // channel now; one that has a card there gets the card refreshed.
+      if (event.entityId) {
+        const deps = await buildChatDeps(ctx, event.companyId);
+        const opened = await ensureTaskThread(deps, event.entityId);
+        if (!opened.created && payload.status !== "done" && payload.status !== "cancelled") await refreshTaskCard(deps, event.entityId);
+      }
+      if (payload.status !== "done" && payload.status !== "cancelled") return;
       // A task that lives in a Slack thread is announced there, not in the
       // notifications channel.
       if (event.entityId) {
         const deps = await buildChatDeps(ctx, event.companyId);
         const announced = await handleIssueStatusChanged(deps, {
           issueId: event.entityId,
-          status: "done",
+          status: String(payload.status),
           title: typeof payload.title === "string" ? payload.title : undefined,
         });
         if (announced) return;
