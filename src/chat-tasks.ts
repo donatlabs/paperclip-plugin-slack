@@ -547,6 +547,30 @@ export function wantsTaskThread(config: ChatTasksConfig, issue: ChatIssueSummary
  */
 export async function ensureTaskThread(deps: ChatTasksDeps, issueId: string): Promise<{ created: boolean; reason?: string }> {
   if (!deps.config.enabled || !deps.config.tasksChannelId) return { created: false, reason: "no_tasks_channel" };
+  // issue.created and issue.updated (the assignment) land within
+  // milliseconds of each other and both come here; the state store's read
+  // and write are two calls, so both would see no card and post one each.
+  // One worker process handles every event, so a lock per task serialises them.
+  return withIssueLock(issueId, () => ensureTaskThreadLocked(deps, issueId));
+}
+
+const issueLocks = new Map<string, Promise<unknown>>();
+
+async function withIssueLock<T>(issueId: string, fn: () => Promise<T>): Promise<T> {
+  const previous = issueLocks.get(issueId) ?? Promise.resolve();
+  const run = previous.then(fn, fn);
+  const settled = run.then(() => undefined, () => undefined);
+  issueLocks.set(issueId, settled);
+  try {
+    return await run;
+  } finally {
+    if (issueLocks.get(issueId) === settled) issueLocks.delete(issueId);
+  }
+}
+
+async function ensureTaskThreadLocked(deps: ChatTasksDeps, issueId: string): Promise<{ created: boolean; reason?: string }> {
+  const channel = deps.config.tasksChannelId;
+  if (!channel) return { created: false, reason: "no_tasks_channel" };
   if (await getIssueThread(deps.state, issueId)) return { created: false, reason: "bound" };
   const issue = await deps.issues.get(issueId);
   if (!issue) return { created: false, reason: "issue_not_found" };
@@ -555,16 +579,16 @@ export async function ensureTaskThread(deps: ChatTasksDeps, issueId: string): Pr
   // the first to claim the key posts the card, the other sees the claim.
   const claimKey = CHAT_STATE_KEYS.card(issueId);
   if (await deps.state.get(claimKey)) return { created: false, reason: "claimed" };
-  await deps.state.set(claimKey, { channel: deps.config.tasksChannelId, ts: "" });
+  await deps.state.set(claimKey, { channel, ts: "" });
   const assigneeName = issue.assigneeAgentId ? await deps.issues.agentName(issue.assigneeAgentId) : null;
   const url = deps.config.issueUrl(issue.id);
-  const card = await deps.slack.postBlocks(deps.config.tasksChannelId, taskCardText(issue, assigneeName, url), taskCardBlocks(issue, assigneeName, url));
+  const card = await deps.slack.postBlocks(channel, taskCardText(issue, assigneeName, url), taskCardBlocks(issue, assigneeName, url));
   if (!card.ok || !card.ts) {
     await deps.state.set(claimKey, "");
-    deps.log.warn("tasks channel card failed", { issueId, channel: deps.config.tasksChannelId, error: card.error });
+    deps.log.warn("tasks channel card failed", { issueId, channel, error: card.error });
     return { created: false, reason: card.error ?? "slack_error" };
   }
-  const binding = { channel: deps.config.tasksChannelId, threadTs: card.ts };
+  const binding = { channel, threadTs: card.ts };
   await deps.state.set(claimKey, { channel: binding.channel, ts: card.ts });
   await bindThread(deps.state, issueId, binding);
   deps.log.info("task thread opened", { issueId, channel: binding.channel, threadTs: card.ts });

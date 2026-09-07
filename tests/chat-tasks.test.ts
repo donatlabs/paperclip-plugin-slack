@@ -457,6 +457,15 @@ describe("tasks channel: one thread per task", () => {
     expect(env.posts.at(-1)).toEqual({ channel: "CTASKS", text: "On it.", threadTs: "card-1" });
   });
 
+  it("opens exactly one thread when created and assigned land together", async () => {
+    const env = makeDeps({ tasksChannelId: "CTASKS" });
+    env.issuesById.set("t1", { id: "t1", identifier: "ACME-7", title: "Race", status: "todo", parentId: null, assigneeAgentId: "agent-ceo" });
+    const results = await Promise.all([ensureTaskThread(env.deps, "t1"), ensureTaskThread(env.deps, "t1"), ensureTaskThread(env.deps, "t1")]);
+    expect(results.filter((r) => r.created)).toHaveLength(1);
+    expect(env.blockPosts).toHaveLength(1);
+    expect(env.store.get(CHAT_STATE_KEYS.issue("t1"))).toEqual({ channel: "CTASKS", threadTs: "card-1" });
+  });
+
   it("skips subtasks, unassigned tasks under the default scope, and everything without a channel", async () => {
     const env = makeDeps({ tasksChannelId: "CTASKS" });
     env.issuesById.set("sub", { id: "sub", identifier: "ACME-8", title: "Part", status: "todo", parentId: "t1", assigneeAgentId: "agent-ceo" });

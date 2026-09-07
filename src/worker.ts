@@ -23,6 +23,7 @@ import {
   type SlackMessageEvent,
   ensureTaskThread,
   refreshTaskCard,
+  getIssueThread,
 } from "./chat-tasks.js";
 import type { SlackMessage } from "./slack-api.js";
 import type { SlackConfig, EscalationRecord, CommandDefinition, SessionEntry } from "./types.js";
@@ -976,8 +977,11 @@ const plugin = definePlugin({
       // A task the tasks channel takes has its card there; that is its
       // announcement, and the notification would only repeat it.
       if (event.entityId) {
-        const opened = await ensureTaskThread(await buildChatDeps(ctx, event.companyId), event.entityId);
-        if (opened.created) return;
+        const deps = await buildChatDeps(ctx, event.companyId);
+        const opened = await ensureTaskThread(deps, event.entityId);
+        // Opened now, or already there (the assignment event got in first):
+        // the card is the announcement either way.
+        if (opened.created || (await getIssueThread(deps.state, event.entityId))) return;
       }
       const live = await getConfig();
       if (!live.notifyOnIssueCreated) return;
