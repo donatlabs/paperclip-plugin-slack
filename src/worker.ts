@@ -68,6 +68,7 @@ import {
   BUILTIN_WATCH_TEMPLATES,
 } from "./proactive-suggestions.js";
 import { readSetupConfig } from "./setup-config.js";
+import { companiesToAct, companyToAct, rememberCompany } from "./company-scope.js";
 import { resolveStartupSlackToken, type SlackRuntimeHealth } from "./runtime-token.js";
 
 let pluginCtx: PluginContext;
@@ -99,8 +100,7 @@ function readPairings(value: unknown): Record<string, string> {
 }
 
 async function chatCompanyId(ctx: PluginContext): Promise<string | undefined> {
-  const companies = await ctx.companies.list({ limit: 1, offset: 0 });
-  return companies[0]?.id;
+  return companyToAct(ctx);
 }
 
 async function buildChatDeps(ctx: PluginContext, companyId: string): Promise<ChatTasksDeps> {
@@ -297,8 +297,7 @@ async function handleSlashCommand(ctx: PluginContext, rawBody: string): Promise<
   const subcommand = parts[0]?.toLowerCase() ?? "";
   const arg = parts[1]?.toLowerCase() ?? "";
 
-  const companies = await ctx.companies.list({ limit: 1, offset: 0 });
-  const companyId = companies[0]?.id ?? "";
+  const companyId = (await chatCompanyId(ctx)) ?? "";
 
   try {
     switch (subcommand) {
@@ -536,6 +535,7 @@ const plugin = definePlugin({
     // workspace nobody has connected Slack on has no config for it yet: the
     // plugin then starts unconfigured rather than failing (setup-config.ts).
     const { companyId: setupCompanyId, config } = await readSetupConfig<SlackConfig>(ctx);
+    rememberCompany(setupCompanyId);
     // Always reads the current persisted config so flag changes (e.g.
     // toggling notifyOnAgentConnected) take effect without restarting the
     // plugin worker.
@@ -1183,7 +1183,7 @@ const plugin = definePlugin({
     // Daily digest
     if (config.enableDailyDigest) {
       ctx.jobs.register("daily-digest", async () => {
-        const companies = await ctx.companies.list({ limit: 100, offset: 0 });
+        const companies = await companiesToAct(ctx);
         for (const company of companies) {
           const channelId = await resolveChannel(ctx, company.id, config.defaultChannelId);
           if (!channelId) continue;
@@ -1289,7 +1289,7 @@ const plugin = definePlugin({
 
     // Escalation timeout job
     ctx.jobs.register("check-escalation-timeouts", async () => {
-      const companies = await ctx.companies.list({ limit: 100, offset: 0 });
+      const companies = await companiesToAct(ctx);
       const timeoutMs = config.escalationTimeoutMs ?? 900000;
       const now = Date.now();
 
@@ -1355,7 +1355,7 @@ const plugin = definePlugin({
 
     // Phase 5: Check watches job
     ctx.jobs.register("check-watches", async () => {
-      const companies = await ctx.companies.list({ limit: 100, offset: 0 });
+      const companies = await companiesToAct(ctx);
       for (const company of companies) {
         // Get recent events from state (populated by event listeners below)
         const recentEventsRaw = await ctx.state.get({
@@ -1558,8 +1558,7 @@ const plugin = definePlugin({
           return;
         }
         if (event?.type === "file_shared") {
-          const companies = await pluginCtx.companies.list({ limit: 1, offset: 0 });
-          const companyId = companies[0]?.id ?? "";
+          const companyId = (await chatCompanyId(pluginCtx)) ?? "";
           const fileId = String(event.file_id ?? "");
           const channelId = String(event.channel_id ?? "");
 
@@ -1596,8 +1595,7 @@ const plugin = definePlugin({
 
       if (!actionValue) return;
 
-      const companies = await pluginCtx.companies.list({ limit: 1, offset: 0 });
-      const companyId = companies[0]?.id ?? "";
+      const companyId = (await chatCompanyId(pluginCtx)) ?? "";
 
       // --- Interaction cards in task threads ---
       if (actionId === INTERACTION_ACTIONS.accept || actionId === INTERACTION_ACTIONS.reject) {
