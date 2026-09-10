@@ -111,6 +111,13 @@ export const CHAT_STATE_KEYS = {
   dedupe: "chat-dedupe",
   /** rolling list of comment ids this plugin wrote, so they are not echoed back */
   ownComments: "chat-own-comments",
+  /**
+   * rolling list of `issueId:text` this plugin is about to write from Slack.
+   * The host raises comment.created before createComment returns, so the id
+   * list alone loses the race and the reply comes back as an echo; the text
+   * is known before the call and closes it.
+   */
+  inbound: "chat-inbound-texts",
   /** issue id -> the run currently shown as working, so a stale finish cannot clear a newer start */
   working: (issueId: string) => `chat-working-${issueId}`,
   /** interaction id -> { ts, status } of its card in the thread */
@@ -134,6 +141,12 @@ export const WORKING_STATUS = "is working on this task…";
 
 const DEDUPE_WINDOW = 500;
 const OWN_COMMENTS_WINDOW = 500;
+const INBOUND_WINDOW = 500;
+
+/** The key an inbound text is remembered under: the issue and the text, whitespace folded. */
+function inboundKey(issueId: string, text: string): string {
+  return `${issueId}:${text.replace(/\s+/g, " ").trim()}`;
+}
 export const MAX_TITLE_LENGTH = 120;
 /** Slack refuses messages over 4000 characters; leave room for the prefix. */
 export const SLACK_CHUNK_LENGTH = 3900;
@@ -338,6 +351,10 @@ async function createTaskForThread(
  * identity with their Slack handle, and the assignee is woken by hand.
  */
 async function relayComment(deps: ChatTasksDeps, issueId: string, text: string, slackUserId: string | undefined): Promise<{ id: string }> {
+  // Remembered before the write: the host's comment.created can arrive
+  // before createComment returns, and the mirror must already know this
+  // text is Slack's own.
+  await rememberInRollingList(deps.state, CHAT_STATE_KEYS.inbound, inboundKey(issueId, text), INBOUND_WINDOW);
   const paired = slackUserId ? deps.config.pairings[slackUserId] : undefined;
   if (paired) {
     try {
@@ -350,7 +367,9 @@ async function relayComment(deps: ChatTasksDeps, issueId: string, text: string, 
       deps.log.warn("human-attributed comment refused; relaying as the bot", { slackUserId, err: String(err) });
     }
   }
-  const comment = await deps.issues.createComment(issueId, formatInboundComment(text, slackUserId));
+  const body = formatInboundComment(text, slackUserId);
+  await rememberInRollingList(deps.state, CHAT_STATE_KEYS.inbound, inboundKey(issueId, body), INBOUND_WINDOW);
+  const comment = await deps.issues.createComment(issueId, body);
   await rememberInRollingList(deps.state, CHAT_STATE_KEYS.ownComments, comment.id, OWN_COMMENTS_WINDOW);
   // A plugin-authored comment never wakes the assignee on its own.
   await deps.issues.requestWakeup(issueId, "slack_reply");
@@ -378,6 +397,9 @@ export async function handleIssueCommentCreated(
   const comments = await deps.issues.listComments(input.issueId);
   const comment = comments.find((c) => c.id === input.commentId);
   if (!comment) return { posted: false, reason: "comment_not_found" };
+  if (await isInRollingList(deps.state, CHAT_STATE_KEYS.inbound, inboundKey(input.issueId, comment.body))) {
+    return { posted: false, reason: "own" };
+  }
   const body = markdownToMrkdwn(comment.body);
   if (!body) return { posted: false, reason: "empty" };
   const chunks = chunkText(body);

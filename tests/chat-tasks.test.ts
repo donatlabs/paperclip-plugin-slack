@@ -503,3 +503,20 @@ describe("tasks channel: one thread per task", () => {
     expect(await refreshTaskCard(mention.deps, "issue-1")).toBe(false);
   });
 });
+
+describe("outbound: a reply relayed from Slack is not echoed back, even when the event beats the bookkeeping", () => {
+  it("knows the text before the comment exists", async () => {
+    const env = makeDeps();
+    await handleInboundMessage(env.deps, { type: "message", channel: "C1", user: "U1", text: `<@${BOT}> start`, ts: "200.1" });
+    await handleInboundMessage(env.deps, { type: "message", channel: "C1", user: "U1", text: "what is the most critical?", ts: "200.2", thread_ts: "200.1" });
+    const relayed = env.comments[env.comments.length - 1]!;
+    env.issueComments.set("issue-1", [{ id: "relayed-1", body: relayed.body, authorType: "user" }]);
+    // The host raised comment.created before createComment returned: the id
+    // is not on the list yet, only the text is.
+    env.store.delete(CHAT_STATE_KEYS.ownComments);
+    expect(await handleIssueCommentCreated(env.deps, { issueId: "issue-1", commentId: "relayed-1" })).toEqual({ posted: false, reason: "own" });
+    // A comment with other words is somebody else's and is posted.
+    env.issueComments.set("issue-1", [{ id: "agent-9", body: "The signing key is committed.", authorType: "agent" }]);
+    expect(await handleIssueCommentCreated(env.deps, { issueId: "issue-1", commentId: "agent-9" })).toEqual({ posted: true });
+  });
+});
